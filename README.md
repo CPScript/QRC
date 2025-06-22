@@ -1,6 +1,4 @@
-# Quantum-Resistant Cryptographic System (QRCs)
-
-QRCs is an experimental post-quantum cryptographic framework implementing hybrid lattice-based encryption with hash-based digital signatures. The system combines Ring Learning With Errors, standard Learning With Errors, and Merkle signature schemes to provide defense against both classical and quantum cryptanalytic attacks.
+> QRCs is an experimental post-quantum cryptographic framework implementing hybrid lattice-based encryption with hash-based digital signatures. The system combines Ring Learning With Errors, standard Learning With Errors, and Merkle signature schemes to provide defense against both classical and quantum cryptanalytic attacks.
 
 ## Architecture
 
