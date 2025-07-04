@@ -9,6 +9,7 @@ import struct
 import secrets
 import hashlib
 import threading
+import argparse
 import numpy as np
 from typing import Tuple, Dict, List, Optional, Union, Any
 from dataclasses import dataclass, field
@@ -137,7 +138,7 @@ class SecureRNG:
         
         for cpu_state in range(16):
             entropy.extend(struct.pack('>d', time.perf_counter()))
-            entropy.extend(struct.pack('>Q', hash(str(locals()))))
+            entropy.extend(struct.pack('>Q', hash(str(locals())) & 0xFFFFFFFFFFFFFFFF))
         
         self._mix_entropy(entropy)
     
@@ -1329,7 +1330,41 @@ class QRCs:
         
         return data[:-pad_length]
 
-if __name__ == "__main__":
+def save_key(key_data: bytes, filename: str):
+    with open(filename, 'wb') as f:
+        f.write(key_data)
+
+def load_key(filename: str) -> bytes:
+    with open(filename, 'rb') as f:
+        return f.read()
+
+def encrypt_file(public_key_file: str, input_file: str, output_file: str, security_level: SecurityLevel):
+    system = QRCs(security_level)
+    
+    public_key = load_key(public_key_file)
+    
+    with open(input_file, 'rb') as f:
+        plaintext = f.read()
+    
+    ciphertext = system.encrypt(plaintext, public_key)
+    
+    with open(output_file, 'wb') as f:
+        f.write(ciphertext)
+
+def decrypt_file(private_key_file: str, input_file: str, output_file: str, security_level: SecurityLevel):
+    system = QRCs(security_level)
+    
+    private_key = load_key(private_key_file)
+    
+    with open(input_file, 'rb') as f:
+        ciphertext = f.read()
+    
+    plaintext = system.decrypt(ciphertext, private_key)
+    
+    with open(output_file, 'wb') as f:
+        f.write(plaintext)
+
+def run_test():
     system = QRCs(SecurityLevel.FORTRESS)
     
     public_key, private_key = system.generate_keypair()
@@ -1351,3 +1386,82 @@ if __name__ == "__main__":
     print(f"Security level: {system.security_level.name}")
     print(f"Ring dimension: {system.params.ring_dimension}")
     print(f"Lattice dimension: {system.params.lattice_dimension}")
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog='crypt.py',
+        description='QRCs - Quantum-Resistant Cryptographic System'
+    )
+    
+    parser.add_argument('command', nargs='?', choices=['keygen', 'encrypt', 'decrypt', 'test'],
+                       help='Operation to perform')
+    parser.add_argument('-s', '--security', choices=['classical_128', 'classical_192', 'classical_256', 
+                                                     'quantum_128', 'quantum_192', 'quantum_256', 'fortress'],
+                       default='quantum_256', help='Security level')
+    parser.add_argument('-f', '--file', help='Input file path')
+    parser.add_argument('-o', '--output', help='Output file path')
+    parser.add_argument('-k', '--key', help='Key file path')
+    parser.add_argument('--public-key', help='Public key file path')
+    parser.add_argument('--private-key', help='Private key file path')
+    
+    args = parser.parse_args()
+    
+    if not args.command:
+        parser.print_help()
+        return
+    
+    security_map = {
+        'classical_128': SecurityLevel.CLASSICAL_128,
+        'classical_192': SecurityLevel.CLASSICAL_192,
+        'classical_256': SecurityLevel.CLASSICAL_256,
+        'quantum_128': SecurityLevel.QUANTUM_128,
+        'quantum_192': SecurityLevel.QUANTUM_192,
+        'quantum_256': SecurityLevel.QUANTUM_256,
+        'fortress': SecurityLevel.FORTRESS
+    }
+    security_level = security_map[args.security]
+    
+    try:
+        if args.command == 'keygen':
+            if not args.output:
+                parser.error("keygen requires -o (base filename for keys)")
+            
+            print(f"Generating {args.security} security level keypair...")
+            system = QRCs(security_level)
+            public_key, private_key = system.generate_keypair()
+            
+            pub_filename = f"{args.output}.pub"
+            priv_filename = f"{args.output}.priv"
+            
+            save_key(public_key, pub_filename)
+            save_key(private_key, priv_filename)
+            
+            print(f"Public key saved to: {pub_filename}")
+            print(f"Private key saved to: {priv_filename}")
+            
+        elif args.command == 'encrypt':
+            if not all([args.file, args.output, args.public_key]):
+                parser.error("encrypt requires -f, -o, and --public-key")
+            
+            print("Encrypting file...")
+            encrypt_file(args.public_key, args.file, args.output, security_level)
+            print(f"File encrypted and saved to: {args.output}")
+            
+        elif args.command == 'decrypt':
+            if not all([args.file, args.output, args.private_key]):
+                parser.error("decrypt requires -f, -o, and --private-key")
+            
+            print("Decrypting file...")
+            decrypt_file(args.private_key, args.file, args.output, security_level)
+            print(f"File decrypted and saved to: {args.output}")
+            
+        elif args.command == 'test':
+            print("Running QRCs test suite...")
+            run_test()
+            
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
