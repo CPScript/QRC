@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 import os
 import sys
 import time
@@ -29,1306 +31,1122 @@ else:
     kernel32 = ntdll = None
 
 class SecurityLevel(IntEnum):
-    CLASSICAL_128 = 128
-    CLASSICAL_192 = 192  
-    CLASSICAL_256 = 256
-    QUANTUM_128 = 384
-    QUANTUM_192 = 512
-    QUANTUM_256 = 768
-    FORTRESS = 1024
+    NIST_1 = 128
+    NIST_3 = 192  
+    NIST_5 = 256
 
 @dataclass
 class CryptoParameters:
-    ring_dimension: int
-    coefficient_modulus: List[int]
-    plaintext_modulus: int
+    n: int
+    q: int
+    k: int
+    eta1: int
+    eta2: int
+    du: int
+    dv: int
     noise_bound: float
-    security_margin: float
     
-    lattice_dimension: int
-    lattice_modulus: int
-    gaussian_parameter: float
-    rejection_bound: int
+    xmss_height: int
+    wots_w: int
+    wots_len: int
     
-    code_length: int
-    code_dimension: int
-    minimum_distance: int
-    
-    hash_tree_height: int
-    ots_winternitz_w: int
-    ots_key_size: int
-    
-    multivariate_variables: int
-    multivariate_equations: int
-    field_size: int
-    
-    isogeny_prime: int
-    isogeny_degree: int
-    supersingular_count: int
-    
-    entropy_pool_size: int
-    rng_reseed_interval: int
-    side_channel_protection: int
+    poly_bytes: int
+    secret_key_bytes: int
+    public_key_bytes: int
+    ciphertext_bytes: int
 
-class ConstantTimeOps:
+class ConstantTime:
     @staticmethod
-    def ct_select_u64(a: int, b: int, condition: int) -> int:
-        mask = (-condition) & 0xFFFFFFFFFFFFFFFF
+    def select_u32(a: int, b: int, c: int) -> int:
+        mask = (-c) & 0xFFFFFFFF
         return (a & mask) | (b & (~mask))
     
     @staticmethod
-    def ct_compare_bytes(a: bytes, b: bytes) -> bool:
+    def compare_bytes(a: bytes, b: bytes) -> bool:
         if len(a) != len(b):
             return False
-        diff = 0
+        d = 0
         for x, y in zip(a, b):
-            diff |= x ^ y
-        return diff == 0
+            d |= x ^ y
+        return d == 0
     
     @staticmethod
-    def ct_conditional_copy(dest: bytearray, src: bytes, condition: int):
-        mask = (-condition) & 0xFF
-        for i in range(len(dest)):
-            if i < len(src):
-                dest[i] = (dest[i] & (~mask)) | (src[i] & mask)
-    
-    @staticmethod
-    def ct_is_zero(x: int) -> int:
-        return ((x | (-x)) >> 63) ^ 1
-    
-    @staticmethod
-    def ct_abs_diff(a: int, b: int) -> int:
-        diff = a - b
-        mask = diff >> 63
-        return (diff ^ mask) - mask
+    def cmov(r: bytearray, x: bytes, b: int):
+        mask = -b & 0xFF
+        for i in range(len(r)):
+            if i < len(x):
+                r[i] ^= mask & (r[i] ^ x[i])
 
-class SecureRNG:
-    def __init__(self, entropy_sources: int = 8):
-        self._entropy_pool = bytearray(8192)
-        self._pool_index = 0
+class SHAKE256:
+    def __init__(self):
+        self.state = [0] * 25
+        self.pos = 0
+        self.rate = 136
+    
+    def absorb(self, data: bytes):
+        for byte in data:
+            if self.pos >= self.rate:
+                self._keccak_f()
+                self.pos = 0
+            self.state[self.pos // 8] ^= byte << (8 * (self.pos % 8))
+            self.pos += 1
+    
+    def finalize(self):
+        if self.pos < self.rate:
+            self.state[self.pos // 8] ^= 0x1F << (8 * (self.pos % 8))
+        self.state[(self.rate - 1) // 8] ^= 0x80 << (8 * ((self.rate - 1) % 8))
+        self._keccak_f()
+        self.pos = 0
+    
+    def squeeze(self, length: int) -> bytes:
+        output = bytearray()
+        while len(output) < length:
+            if self.pos >= self.rate:
+                self._keccak_f()
+                self.pos = 0
+            
+            remaining = min(length - len(output), self.rate - self.pos)
+            for i in range(remaining):
+                byte_idx = (self.pos + i) // 8
+                bit_offset = ((self.pos + i) % 8) * 8
+                if byte_idx < len(self.state):
+                    output.append((self.state[byte_idx] >> bit_offset) & 0xFF)
+                else:
+                    output.append(0)
+            
+            self.pos += remaining
+        
+        return bytes(output)
+    
+    def _keccak_f(self):
+        RC = [0x01, 0x82, 0x8a, 0x00, 0x8b, 0x01, 0x81, 0x09,
+              0x8a, 0x88, 0x09, 0x03, 0x8b, 0x8b, 0x8b, 0x89,
+              0x03, 0x02, 0x80, 0x00, 0x0a, 0x0a, 0x81, 0x8a]
+        
+        for round_idx in range(24):
+            C = [self.state[i] ^ self.state[i+5] ^ self.state[i+10] ^ self.state[i+15] ^ self.state[i+20] for i in range(5)]
+            D = [C[(i+4)%5] ^ self._rotl64(C[(i+1)%5], 1) for i in range(5)]
+            
+            for i in range(25):
+                self.state[i] ^= D[i % 5]
+            
+            B = [0] * 25
+            B[0] = self.state[0]
+            for i in range(1, 25):
+                j = (i * 6) % 25
+                rho = ((i-1) * i) // 2
+                B[j] = self._rotl64(self.state[i], rho % 64)
+            
+            for i in range(0, 25, 5):
+                for j in range(5):
+                    self.state[i+j] = B[i+j] ^ ((~B[i+(j+1)%5]) & B[i+(j+2)%5])
+            
+            self.state[0] ^= RC[round_idx]
+    
+    def _rotl64(self, x: int, n: int) -> int:
+        n = n % 64
+        if n == 0:
+            return x & 0xFFFFFFFFFFFFFFFF
+        return ((x << n) | (x >> (64 - n))) & 0xFFFFFFFFFFFFFFFF
+
+def shake256(data: bytes, length: int) -> bytes:
+    shake = SHAKE256()
+    shake.absorb(data)
+    shake.finalize()
+    return shake.squeeze(length)
+
+class SecureRandom:
+    def __init__(self):
+        self._pool = bytearray(8192)
+        self._idx = 0
         self._counter = 0
         self._last_reseed = time.time_ns()
-        self._entropy_sources = entropy_sources
         self._lock = threading.Lock()
-        self._initialize_pool()
+        self._reseed()
     
-    def _initialize_pool(self):
+    def _reseed(self):
         entropy = bytearray()
-        
-        entropy.extend(secrets.token_bytes(1024))
+        entropy.extend(secrets.token_bytes(2048))
         entropy.extend(struct.pack('>Q', time.time_ns()))
         entropy.extend(struct.pack('>Q', os.getpid()))
         
         if hasattr(os, 'urandom'):
-            entropy.extend(os.urandom(512))
+            entropy.extend(os.urandom(1024))
+        
+        try:
+            with open('/dev/urandom', 'rb') as f:
+                entropy.extend(f.read(512))
+        except:
+            pass
         
         if kernel32:
             try:
-                entropy.extend(self._windows_entropy())
+                buf = ctypes.create_string_buffer(256)
+                kernel32.RtlGenRandom(buf, 256)
+                entropy.extend(buf.raw)
             except:
                 pass
         
-        try:
-            with open('/dev/random', 'rb') as f:
-                entropy.extend(f.read(256))
-        except:
-            pass
-        
-        entropy.extend(hashlib.sha3_512(str(threading.current_thread()).encode()).digest())
-        
-        for cpu_state in range(16):
-            entropy.extend(struct.pack('>d', time.perf_counter()))
-            entropy.extend(struct.pack('>Q', hash(str(locals())) & 0xFFFFFFFFFFFFFFFF))
-        
-        self._mix_entropy(entropy)
-    
-    def _windows_entropy(self) -> bytes:
-        entropy = bytearray()
-        try:
-            perf_counter = ctypes.c_ulonglong()
-            kernel32.QueryPerformanceCounter(ctypes.byref(perf_counter))
-            entropy.extend(struct.pack('>Q', perf_counter.value))
-            
-            tick_count = kernel32.GetTickCount64()
-            entropy.extend(struct.pack('>Q', tick_count))
-        except:
-            pass
-        return bytes(entropy)
-    
-    def _mix_entropy(self, new_entropy: bytes):
-        mixed = hashlib.sha3_512(bytes(self._entropy_pool) + new_entropy).digest()
+        mixed = shake256(bytes(self._pool) + bytes(entropy), len(self._pool))
         for i in range(len(mixed)):
-            self._entropy_pool[i % len(self._entropy_pool)] ^= mixed[i]
+            self._pool[i] = mixed[i]
         
-        self._pool_index = (self._pool_index + len(new_entropy)) % len(self._entropy_pool)
+        self._idx = 0
+        self._counter = 0
+        self._last_reseed = time.time_ns()
     
-    def _should_reseed(self) -> bool:
-        current_time = time.time_ns()
-        return (current_time - self._last_reseed) > 60_000_000_000 or self._counter > 1000000
-    
-    def get_bytes(self, length: int) -> bytes:
+    def bytes(self, length: int) -> bytes:
         with self._lock:
-            if self._should_reseed():
-                self._initialize_pool()
-                self._last_reseed = time.time_ns()
-                self._counter = 0
-            
-            self._counter += 1
+            if time.time_ns() - self._last_reseed > 300_000_000_000 or self._counter > 1000000:
+                self._reseed()
             
             output = bytearray()
-            for _ in range((length + 63) // 64):
-                state = bytes(self._entropy_pool[self._pool_index:self._pool_index + 64])
-                if len(state) < 64:
-                    state += bytes(self._entropy_pool[:64 - len(state)])
+            while len(output) < length:
+                if self._idx >= len(self._pool) - 64:
+                    self._reseed()
                 
-                chunk = hashlib.sha3_512(state + struct.pack('>Q', self._counter)).digest()
+                chunk_size = min(64, length - len(output))
+                state = bytes(self._pool[self._idx:self._idx + 64])
+                chunk = shake256(state + struct.pack('>Q', self._counter), chunk_size)
                 output.extend(chunk)
                 
-                self._pool_index = (self._pool_index + 13) % len(self._entropy_pool)
+                self._idx = (self._idx + 17) % (len(self._pool) - 64)
+                self._counter += 1
             
-            self._mix_entropy(struct.pack('>Q', time.time_ns()))
-            
-            return bytes(output[:length])
+            return bytes(output)
     
-    def get_uniform_int(self, bound: int) -> int:
+    def uniform_int(self, bound: int) -> int:
         if bound <= 1:
             return 0
-        
-        bit_length = bound.bit_length()
-        byte_length = (bit_length + 7) // 8
-        mask = (1 << bit_length) - 1
-        
+        byte_length = (bound.bit_length() + 7) // 8
         while True:
-            candidate_bytes = self.get_bytes(byte_length)
-            candidate = int.from_bytes(candidate_bytes, 'big') & mask
+            candidate = int.from_bytes(self.bytes(byte_length), 'little')
             if candidate < bound:
                 return candidate
 
-class DiscreteGaussian:
-    def __init__(self, sigma: float, precision: int = 128, tail_bound: int = 12):
+class GaussianSampler:
+    def __init__(self, sigma: float, precision: int = 64):
         self.sigma = sigma
         self.precision = precision
-        self.tail_bound = int(tail_bound * sigma)
-        self.rng = SecureRNG()
-        self._build_tables()
+        self.tail_bound = max(1, int(6 * sigma))
+        self.rng = SecureRandom()
+        self._build_cdt()
     
-    def _build_tables(self):
-        self.cumulative_table = []
-        self.alias_table = []
+    def _build_cdt(self):
+        self.cdt = []
+        total = 0.0
         
-        bound = self.tail_bound
-        probabilities = []
-        
-        total_prob = 0.0
-        for z in range(-bound, bound + 1):
+        for z in range(-self.tail_bound, self.tail_bound + 1):
             prob = np.exp(-z * z / (2.0 * self.sigma * self.sigma))
-            probabilities.append(prob)
-            total_prob += prob
+            total += prob
+            self.cdt.append((total, z))
         
-        probabilities = [p / total_prob for p in probabilities]
-        
-        cumulative = 0.0
-        for i, prob in enumerate(probabilities):
-            cumulative += prob
-            self.cumulative_table.append((cumulative, i - bound))
-        
-        n = len(probabilities)
-        scaled_probs = [p * n for p in probabilities]
-        
-        small = []
-        large = []
-        
-        for i, prob in enumerate(scaled_probs):
-            if prob < 1.0:
-                small.append(i)
-            else:
-                large.append(i)
-        
-        prob_alias = [0.0] * n
-        alias = [0] * n
-        
-        while small and large:
-            s = small.pop()
-            l = large.pop()
-            
-            prob_alias[s] = scaled_probs[s]
-            alias[s] = l
-            
-            scaled_probs[l] = scaled_probs[l] - (1.0 - scaled_probs[s])
-            
-            if scaled_probs[l] < 1.0:
-                small.append(l)
-            else:
-                large.append(l)
-        
-        while large:
-            prob_alias[large.pop()] = 1.0
-        
-        while small:
-            prob_alias[small.pop()] = 1.0
-        
-        self.alias_table = list(zip(prob_alias, alias))
+        if total > 0:
+            self.cdt = [(p / total, z) for p, z in self.cdt]
+        else:
+            self.cdt = [(1.0, 0)]
     
     def sample(self) -> int:
-        if not self.alias_table:
-            u = int.from_bytes(self.rng.get_bytes(8), 'big') / (2**64)
-            for cumulative, value in self.cumulative_table:
-                if u <= cumulative:
-                    return value
-            return self.cumulative_table[-1][1]
-        
-        n = len(self.alias_table)
-        i = self.rng.get_uniform_int(n)
-        u = int.from_bytes(self.rng.get_bytes(8), 'big') / (2**64)
-        
-        prob, alias = self.alias_table[i]
-        if u <= prob:
-            return i - self.tail_bound
-        else:
-            return alias - self.tail_bound
+        u = int.from_bytes(self.rng.bytes(8), 'little') / (2**64)
+        for prob, value in self.cdt:
+            if u <= prob:
+                return value
+        return 0
     
     def sample_vector(self, length: int) -> np.ndarray:
-        result = np.zeros(length, dtype=np.int64)
-        for i in range(length):
-            result[i] = self.sample()
-        return result
+        return np.array([self.sample() for _ in range(length)], dtype=np.int32)
 
-class ModularArithmetic:
-    @staticmethod
-    def mod_add(a: int, b: int, mod: int) -> int:
-        return (a + b) % mod
-    
-    @staticmethod
-    def mod_sub(a: int, b: int, mod: int) -> int:
-        return (a - b) % mod
-    
-    @staticmethod
-    def mod_mul(a: int, b: int, mod: int) -> int:
-        return (a * b) % mod
-    
-    @staticmethod
-    def mod_exp(base: int, exp: int, mod: int) -> int:
-        result = 1
-        base = base % mod
-        while exp > 0:
-            if exp & 1:
-                result = (result * base) % mod
-            exp >>= 1
-            base = (base * base) % mod
-        return result
-    
-    @staticmethod
-    def mod_inverse(a: int, mod: int) -> int:
-        def extended_gcd(a: int, b: int) -> Tuple[int, int, int]:
-            if a == 0:
-                return b, 0, 1
-            gcd, x1, y1 = extended_gcd(b % a, a)
-            x = y1 - (b // a) * x1
-            y = x1
-            return gcd, x, y
-        
-        gcd, x, _ = extended_gcd(a % mod, mod)
-        if gcd != 1:
-            raise ValueError("Modular inverse does not exist")
-        return (x % mod + mod) % mod
-
-class NumberTheoreticTransform:
-    def __init__(self, length: int, modulus: int):
-        self.length = length
-        self.modulus = modulus
+class NTT:
+    def __init__(self, n: int, q: int):
+        self.n = n
+        self.q = q
+        self.ninv = pow(n, q - 2, q)
         self.root = self._find_primitive_root()
-        self.inv_length = ModularArithmetic.mod_inverse(length, modulus)
-        self._precompute_tables()
+        self.zetas = self._compute_zetas()
+        self.zetas_inv = [pow(z, q - 2, q) for z in self.zetas]
     
     def _find_primitive_root(self) -> int:
-        if self.modulus == 1:
-            return 0
-        
-        factors = self._factorize(self.modulus - 1)
-        
-        for g in range(2, self.modulus):
-            is_primitive = True
-            for factor in factors:
-                if ModularArithmetic.mod_exp(g, (self.modulus - 1) // factor, self.modulus) == 1:
-                    is_primitive = False
-                    break
-            if is_primitive:
-                return ModularArithmetic.mod_exp(g, (self.modulus - 1) // self.length, self.modulus)
-        
-        raise ValueError("Primitive root not found")
+        for g in range(2, min(self.q, 1000)):
+            if pow(g, self.n, self.q) == 1 and pow(g, self.n // 2, self.q) != 1:
+                return g
+        return 17
     
-    def _factorize(self, n: int) -> List[int]:
-        factors = []
-        d = 2
-        while d * d <= n:
-            while n % d == 0:
-                factors.append(d)
-                n //= d
-            d += 1
-        if n > 1:
-            factors.append(n)
-        return list(set(factors))
-    
-    def _precompute_tables(self):
-        self.forward_table = []
-        self.inverse_table = []
-        
-        root_powers = [1]
-        inv_root = ModularArithmetic.mod_inverse(self.root, self.modulus)
-        inv_root_powers = [1]
-        
-        for i in range(1, self.length):
-            root_powers.append((root_powers[-1] * self.root) % self.modulus)
-            inv_root_powers.append((inv_root_powers[-1] * inv_root) % self.modulus)
-        
-        self.forward_table = root_powers
-        self.inverse_table = inv_root_powers
-    
-    def forward_transform(self, coefficients: np.ndarray) -> np.ndarray:
-        n = len(coefficients)
-        if n != self.length:
-            raise ValueError("Invalid coefficient vector length")
-        
-        result = coefficients.copy()
+    def _compute_zetas(self) -> List[int]:
+        zetas = []
+        k = 1
         
         length = 2
-        while length <= n:
-            step = n // length
-            for i in range(0, n, length):
-                root_idx = 0
-                for j in range(length // 2):
-                    u = result[i + j]
-                    v = (result[i + j + length // 2] * self.forward_table[root_idx]) % self.modulus
-                    result[i + j] = (u + v) % self.modulus
-                    result[i + j + length // 2] = (u - v) % self.modulus
-                    root_idx += step
-            length <<= 1
+        while length <= self.n:
+            for start in range(0, self.n, 2 * length):
+                zeta = pow(self.root, k * (self.q - 1) // self.n, self.q)
+                zetas.append(zeta)
+                k += 2
+            length *= 2
         
-        return result
+        return zetas
     
-    def inverse_transform(self, coefficients: np.ndarray) -> np.ndarray:
-        n = len(coefficients)
-        if n != self.length:
-            raise ValueError("Invalid coefficient vector length")
+    def forward(self, poly: np.ndarray) -> np.ndarray:
+        a = poly.copy().astype(np.int64)
+        k = 0
         
-        result = coefficients.copy()
+        length = 2
+        while length <= self.n:
+            for start in range(0, self.n, 2 * length):
+                if k < len(self.zetas):
+                    zeta = self.zetas[k]
+                    k += 1
+                else:
+                    zeta = 1
+                    
+                for j in range(start, start + length):
+                    if j + length < len(a):
+                        t = (zeta * a[j + length]) % self.q
+                        a[j + length] = (a[j] - t) % self.q
+                        a[j] = (a[j] + t) % self.q
+            length *= 2
         
-        length = n
+        return a.astype(np.int32)
+    
+    def inverse(self, poly: np.ndarray) -> np.ndarray:
+        a = poly.copy().astype(np.int64)
+        k = len(self.zetas_inv) - 1
+        
+        length = self.n // 2
         while length >= 2:
-            step = n // length
-            for i in range(0, n, length):
-                root_idx = 0
-                for j in range(length // 2):
-                    u = result[i + j]
-                    v = result[i + j + length // 2]
-                    result[i + j] = (u + v) % self.modulus
-                    result[i + j + length // 2] = ((u - v) * self.inverse_table[root_idx]) % self.modulus
-                    root_idx += step
-            length >>= 1
+            for start in range(0, self.n, 2 * length):
+                if k >= 0 and k < len(self.zetas_inv):
+                    zeta = self.zetas_inv[k]
+                    k -= 1
+                else:
+                    zeta = 1
+                    
+                for j in range(start, start + length):
+                    if j + length < len(a):
+                        t = a[j]
+                        a[j] = (t + a[j + length]) % self.q
+                        a[j + length] = (zeta * (t - a[j + length])) % self.q
+            length //= 2
         
-        for i in range(n):
-            result[i] = (result[i] * self.inv_length) % self.modulus
+        for i in range(len(a)):
+            a[i] = (a[i] * self.ninv) % self.q
         
-        return result
+        return a.astype(np.int32)
 
-class RingPolynomial:
-    def __init__(self, coefficients: np.ndarray, modulus: int):
-        self.coefficients = coefficients % modulus
-        self.modulus = modulus
-        self.degree = len(coefficients)
-        self.ntt = NumberTheoreticTransform(self.degree, modulus)
+class Polynomial:
+    def __init__(self, coeffs: np.ndarray, q: int):
+        self.coeffs = np.array(coeffs, dtype=np.int32) % q
+        self.q = q
+        self.n = len(coeffs)
+        self.ntt = NTT(self.n, q) if self.n in [256, 512, 1024] and q > self.n else None
     
-    def __add__(self, other: 'RingPolynomial') -> 'RingPolynomial':
-        if self.degree != other.degree or self.modulus != other.modulus:
-            raise ValueError("Incompatible polynomials")
-        
-        result = (self.coefficients + other.coefficients) % self.modulus
-        return RingPolynomial(result, self.modulus)
+    def __add__(self, other: 'Polynomial') -> 'Polynomial':
+        return Polynomial((self.coeffs + other.coeffs) % self.q, self.q)
     
-    def __sub__(self, other: 'RingPolynomial') -> 'RingPolynomial':
-        if self.degree != other.degree or self.modulus != other.modulus:
-            raise ValueError("Incompatible polynomials")
-        
-        result = (self.coefficients - other.coefficients) % self.modulus
-        return RingPolynomial(result, self.modulus)
+    def __sub__(self, other: 'Polynomial') -> 'Polynomial':
+        return Polynomial((self.coeffs - other.coeffs) % self.q, self.q)
     
-    def __mul__(self, other: 'RingPolynomial') -> 'RingPolynomial':
-        if self.degree != other.degree or self.modulus != other.modulus:
-            raise ValueError("Incompatible polynomials")
+    def __mul__(self, other: 'Polynomial') -> 'Polynomial':
+        if self.ntt and other.ntt and len(self.coeffs) == len(other.coeffs):
+            try:
+                a_ntt = self.ntt.forward(self.coeffs)
+                b_ntt = self.ntt.forward(other.coeffs)
+                c_ntt = (a_ntt * b_ntt) % self.q
+                result = self.ntt.inverse(c_ntt)
+                return Polynomial(result, self.q)
+            except:
+                pass
         
-        a_ntt = self.ntt.forward_transform(self.coefficients)
-        b_ntt = self.ntt.forward_transform(other.coefficients)
+        result = np.zeros(self.n, dtype=np.int32)
+        for i in range(self.n):
+            for j in range(self.n):
+                idx = i + j
+                coeff_product = int(self.coeffs[i]) * int(other.coeffs[j])
+                if idx >= self.n:
+                    result[idx - self.n] = (result[idx - self.n] - coeff_product) % self.q
+                else:
+                    result[idx] = (result[idx] + coeff_product) % self.q
         
-        c_ntt = (a_ntt * b_ntt) % self.modulus
-        result = self.ntt.inverse_transform(c_ntt)
-        
-        return RingPolynomial(result, self.modulus)
+        return Polynomial(result, self.q)
     
-    def scalar_mul(self, scalar: int) -> 'RingPolynomial':
-        result = (self.coefficients * scalar) % self.modulus
-        return RingPolynomial(result, self.modulus)
+    def compress(self, d: int) -> np.ndarray:
+        if d <= 0 or d >= 32:
+            return self.coeffs.copy()
+        scale = 1 << d
+        return np.array([((int(x) * scale + self.q // 2) // self.q) % scale for x in self.coeffs], dtype=np.int32)
+    
+    def decompress(self, compressed: np.ndarray, d: int) -> 'Polynomial':
+        if d <= 0 or d >= 32:
+            return Polynomial(compressed, self.q)
+        scale = 1 << d
+        coeffs = np.array([int(x) * self.q // scale for x in compressed], dtype=np.int32)
+        return Polynomial(coeffs, self.q)
     
     def to_bytes(self) -> bytes:
-        return b''.join(struct.pack('>Q', int(c)) for c in self.coefficients)
+        if self.q <= 1:
+            return bytes(len(self.coeffs))
+            
+        bits_per_coeff = max(1, (self.q - 1).bit_length())
+        total_bits = self.n * bits_per_coeff
+        total_bytes = (total_bits + 7) // 8
+        
+        result = bytearray(total_bytes)
+        bit_pos = 0
+        
+        for coeff in self.coeffs:
+            coeff = int(coeff) % self.q
+            for bit in range(bits_per_coeff):
+                if bit >= 0 and coeff & (1 << bit):
+                    byte_idx = bit_pos // 8
+                    bit_idx = bit_pos % 8
+                    if byte_idx < len(result) and bit_idx >= 0:
+                        result[byte_idx] |= 1 << bit_idx
+                bit_pos += 1
+        
+        return bytes(result)
     
     @classmethod
-    def from_bytes(cls, data: bytes, modulus: int) -> 'RingPolynomial':
-        coeffs = []
-        for i in range(0, len(data), 8):
-            chunk = data[i:i+8]
-            if len(chunk) == 8:
-                coeffs.append(struct.unpack('>Q', chunk)[0])
-        return cls(np.array(coeffs, dtype=np.int64), modulus)
-
-class AdvancedErrorCorrection:
-    def __init__(self, n: int, k: int, t: int):
-        self.n = n
-        self.k = k
-        self.t = t
-        self.field_size = 256
-        self._build_log_antilog_tables()
-        self._build_generator_polynomial()
-    
-    def _build_log_antilog_tables(self):
-        self.log_table = [0] * self.field_size
-        self.antilog_table = [0] * self.field_size
-        
-        x = 1
-        for i in range(self.field_size - 1):
-            self.antilog_table[i] = x
-            self.log_table[x] = i
-            x <<= 1
-            if x & self.field_size:
-                x ^= 0x11d
-    
-    def _gf_mult(self, a: int, b: int) -> int:
-        if a == 0 or b == 0:
-            return 0
-        return self.antilog_table[(self.log_table[a] + self.log_table[b]) % (self.field_size - 1)]
-    
-    def _gf_div(self, a: int, b: int) -> int:
-        if a == 0:
-            return 0
-        if b == 0:
-            raise ValueError("Division by zero in GF")
-        return self.antilog_table[(self.log_table[a] - self.log_table[b]) % (self.field_size - 1)]
-    
-    def _gf_pow(self, a: int, exp: int) -> int:
-        if a == 0:
-            return 0
-        return self.antilog_table[(self.log_table[a] * exp) % (self.field_size - 1)]
-    
-    def _build_generator_polynomial(self):
-        self.generator = [1]
-        for i in range(2 * self.t):
-            new_gen = [0] * (len(self.generator) + 1)
-            alpha_i = self.antilog_table[i % (self.field_size - 1)]
+    def from_bytes(cls, data: bytes, n: int, q: int) -> 'Polynomial':
+        if q <= 1:
+            return cls(np.zeros(n, dtype=np.int32), max(q, 2))
             
-            for j in range(len(self.generator)):
-                new_gen[j] ^= self.generator[j]
-                new_gen[j + 1] ^= self._gf_mult(self.generator[j], alpha_i)
-            
-            self.generator = new_gen
-    
-    def encode(self, data: bytes) -> bytes:
-        if len(data) > self.k:
-            raise ValueError("Data too large")
-        
-        padded_data = data + bytes(self.k - len(data))
-        message = list(padded_data) + [0] * (self.n - self.k)
-        
-        for i in range(self.k):
-            if message[i] != 0:
-                coeff = message[i]
-                for j in range(len(self.generator)):
-                    message[i + j] ^= self._gf_mult(coeff, self.generator[j])
-        
-        return bytes(message)
-    
-    def decode(self, received: bytes) -> Optional[bytes]:
-        if len(received) != self.n:
-            return None
-        
-        received = list(received)
-        syndromes = self._compute_syndromes(received)
-        
-        if all(s == 0 for s in syndromes):
-            return bytes(received[:self.k])
-        
-        error_locator = self._berlekamp_massey(syndromes)
-        if not error_locator:
-            return None
-        
-        error_positions = self._find_error_positions(error_locator)
-        if len(error_positions) > self.t:
-            return None
-        
-        error_magnitudes = self._compute_error_magnitudes(syndromes, error_positions)
-        
-        for pos, mag in zip(error_positions, error_magnitudes):
-            received[pos] ^= mag
-        
-        return bytes(received[:self.k])
-    
-    def _compute_syndromes(self, received: List[int]) -> List[int]:
-        syndromes = []
-        for i in range(2 * self.t):
-            syndrome = 0
-            alpha_i = self.antilog_table[i % (self.field_size - 1)]
-            alpha_power = 1
-            
-            for j in range(self.n):
-                syndrome ^= self._gf_mult(received[j], alpha_power)
-                alpha_power = self._gf_mult(alpha_power, alpha_i)
-            
-            syndromes.append(syndrome)
-        
-        return syndromes
-    
-    def _berlekamp_massey(self, syndromes: List[int]) -> List[int]:
-        n = len(syndromes)
-        c = [1] + [0] * n
-        b = [1] + [0] * n
-        l = 0
-        m = 1
+        bits_per_coeff = max(1, (q - 1).bit_length())
+        coeffs = np.zeros(n, dtype=np.int32)
+        bit_pos = 0
         
         for i in range(n):
-            d = syndromes[i]
-            for j in range(1, l + 1):
-                if j < len(c):
-                    d ^= self._gf_mult(c[j], syndromes[i - j])
-            
-            if d == 0:
-                m += 1
-            else:
-                t = c[:]
-                
-                for j in range(len(b)):
-                    if i + j < len(c):
-                        c[i + j] ^= self._gf_mult(d, b[j])
-                
-                if 2 * l <= i:
-                    l = i + 1 - l
-                    for j in range(len(t)):
-                        if j < len(b):
-                            b[j] = self._gf_div(t[j], d) if d != 0 else 0
-                    m = 1
-                else:
-                    m += 1
+            coeff = 0
+            for bit in range(bits_per_coeff):
+                byte_idx = bit_pos // 8
+                bit_idx = bit_pos % 8
+                if (byte_idx < len(data) and bit_idx >= 0 and 
+                    bit >= 0 and (data[byte_idx] & (1 << bit_idx))):
+                    coeff |= 1 << bit
+                bit_pos += 1
+            coeffs[i] = coeff % q
         
-        return c[:l+1]
-    
-    def _find_error_positions(self, error_locator: List[int]) -> List[int]:
-        positions = []
-        for i in range(self.n):
-            alpha_inv_i = self.antilog_table[(-i) % (self.field_size - 1)]
-            result = 0
-            alpha_power = 1
-            
-            for coeff in error_locator:
-                result ^= self._gf_mult(coeff, alpha_power)
-                alpha_power = self._gf_mult(alpha_power, alpha_inv_i)
-            
-            if result == 0:
-                positions.append(i)
-        
-        return positions
-    
-    def _compute_error_magnitudes(self, syndromes: List[int], positions: List[int]) -> List[int]:
-        magnitudes = []
-        for pos in positions:
-            numerator = 0
-            denominator = 1
-            
-            alpha_i = self.antilog_table[pos % (self.field_size - 1)]
-            alpha_power = 1
-            
-            for syndrome in syndromes:
-                numerator ^= self._gf_mult(syndrome, alpha_power)
-                alpha_power = self._gf_mult(alpha_power, alpha_i)
-            
-            for other_pos in positions:
-                if other_pos != pos:
-                    alpha_j = self.antilog_table[other_pos % (self.field_size - 1)]
-                    denominator = self._gf_mult(denominator, 
-                                               self.antilog_table[(pos - other_pos) % (self.field_size - 1)])
-            
-            magnitude = self._gf_div(numerator, denominator) if denominator != 0 else 0
-            magnitudes.append(magnitude)
-        
-        return magnitudes
+        return cls(coeffs, q)
 
-class HybridSignature:
-    def __init__(self, tree_height: int, ots_w: int):
-        self.tree_height = tree_height
-        self.ots_w = ots_w
-        self.rng = SecureRNG()
-        self.signature_count = 0
-        self.max_signatures = 2 ** tree_height
-        
-    def keygen(self) -> Tuple[bytes, bytes]:
-        master_seed = self.rng.get_bytes(64)
-        
-        leaf_keys = []
-        for i in range(self.max_signatures):
-            leaf_seed = hashlib.sha3_512(master_seed + struct.pack('>Q', i)).digest()
-            sk_ots = self._ots_keygen(leaf_seed)
-            pk_ots = self._ots_derive_public_key(sk_ots)
-            leaf_keys.append(hashlib.sha3_256(pk_ots).digest())
-        
-        tree_nodes = self._build_merkle_tree(leaf_keys)
-        root = tree_nodes[0][0]
-        
-        private_key = {
-            'master_seed': base64.b64encode(master_seed).decode(),
-            'signature_count': 0,
-            'tree_height': self.tree_height,
-            'ots_w': self.ots_w,
-            'version': 2
-        }
-        
-        public_key = {
-            'root': base64.b64encode(root).decode(),
-            'tree_height': self.tree_height,
-            'ots_w': self.ots_w,
-            'version': 2
-        }
-        
-        return (base64.b64encode(json.dumps(public_key).encode()),
-                base64.b64encode(json.dumps(private_key).encode()))
+class PolynomialVector:
+    def __init__(self, polys: List[Polynomial]):
+        self.polys = polys
+        self.k = len(polys)
+        self.q = polys[0].q if polys else 2
+        self.n = polys[0].n if polys else 0
     
-    def sign(self, message: bytes, private_key: bytes) -> bytes:
-        sk_data = json.loads(base64.b64decode(private_key))
-        
-        if sk_data['signature_count'] >= self.max_signatures:
-            raise ValueError("Signature limit exceeded")
-        
-        idx = sk_data['signature_count']
-        master_seed = base64.b64decode(sk_data['master_seed'])
-        
-        leaf_seed = hashlib.sha3_512(master_seed + struct.pack('>Q', idx)).digest()
-        sk_ots = self._ots_keygen(leaf_seed)
-        
-        message_hash = hashlib.sha3_512(message + struct.pack('>Q', idx)).digest()
-        ots_signature = self._ots_sign(message_hash, sk_ots)
-        
-        auth_path = self._compute_auth_path(master_seed, idx)
-        
-        signature = {
-            'index': idx,
-            'ots_signature': [base64.b64encode(s).decode() for s in ots_signature],
-            'auth_path': [base64.b64encode(p).decode() for p in auth_path],
-            'version': 2
-        }
-        
-        sk_data['signature_count'] += 1
-        
-        return base64.b64encode(json.dumps(signature).encode())
+    def __add__(self, other: 'PolynomialVector') -> 'PolynomialVector':
+        return PolynomialVector([p1 + p2 for p1, p2 in zip(self.polys, other.polys)])
     
-    def verify(self, message: bytes, signature: bytes, public_key: bytes) -> bool:
-        try:
-            sig_data = json.loads(base64.b64decode(signature))
-            pk_data = json.loads(base64.b64decode(public_key))
-            
-            idx = sig_data['index']
-            ots_signature = [base64.b64decode(s) for s in sig_data['ots_signature']]
-            auth_path = [base64.b64decode(p) for p in sig_data['auth_path']]
-            root = base64.b64decode(pk_data['root'])
-            
-            message_hash = hashlib.sha3_512(message + struct.pack('>Q', idx)).digest()
-            
-            if not self._ots_verify(message_hash, ots_signature):
-                return False
-            
-            pk_ots = self._ots_recover_public_key(message_hash, ots_signature)
-            leaf_hash = hashlib.sha3_256(pk_ots).digest()
-            
-            computed_root = self._verify_merkle_path(leaf_hash, idx, auth_path)
-            
-            return ConstantTimeOps.ct_compare_bytes(computed_root, root)
-            
-        except Exception:
-            return False
+    def __sub__(self, other: 'PolynomialVector') -> 'PolynomialVector':
+        return PolynomialVector([p1 - p2 for p1, p2 in zip(self.polys, other.polys)])
     
-    def _ots_keygen(self, seed: bytes) -> List[bytes]:
-        key_parts = []
-        l1 = 256 // 4 if self.ots_w == 16 else 256 // 8
-        l2 = 3 if self.ots_w == 16 else 2
-        l = l1 + l2
-        
-        for i in range(l):
-            part_seed = hashlib.sha3_256(seed + struct.pack('>H', i)).digest()
-            key_parts.append(part_seed)
-        
-        return key_parts
+    def dot(self, other: 'PolynomialVector') -> Polynomial:
+        if not self.polys or not other.polys:
+            return Polynomial(np.zeros(self.n, dtype=np.int32), self.q)
+            
+        result = self.polys[0] * other.polys[0]
+        for i in range(1, min(len(self.polys), len(other.polys))):
+            result = result + (self.polys[i] * other.polys[i])
+        return result
     
-    def _ots_derive_public_key(self, private_key: List[bytes]) -> bytes:
-        public_parts = []
-        
-        for sk_part in private_key:
-            pk_part = sk_part
-            for _ in range(self.ots_w - 1):
-                pk_part = hashlib.sha3_256(pk_part).digest()
-            public_parts.append(pk_part)
-        
-        return b''.join(public_parts)
+    def compress(self, d: int) -> List[np.ndarray]:
+        return [poly.compress(d) for poly in self.polys]
     
-    def _ots_sign(self, message: bytes, private_key: List[bytes]) -> List[bytes]:
-        signature_parts = []
+    def decompress(self, compressed: List[np.ndarray], d: int) -> 'PolynomialVector':
+        polys = []
+        for comp in compressed:
+            base_poly = Polynomial(np.zeros(self.n, dtype=np.int32), self.q)
+            polys.append(base_poly.decompress(comp, d))
+        return PolynomialVector(polys)
+    
+    def to_bytes(self) -> bytes:
+        return b''.join(poly.to_bytes() for poly in self.polys)
+    
+    @classmethod
+    def from_bytes(cls, data: bytes, k: int, n: int, q: int) -> 'PolynomialVector':
+        base_poly = Polynomial(np.zeros(n, dtype=np.int32), q)
+        poly_size = len(base_poly.to_bytes())
+        polys = []
         
-        l1 = 256 // 4 if self.ots_w == 16 else 256 // 8
-        l2 = 3 if self.ots_w == 16 else 2
-        
-        checksum = 0
-        message_blocks = []
-        
-        if self.ots_w == 16:
-            for i in range(0, 256, 4):
-                byte_idx = i // 8
-                bit_offset = i % 8
-                if byte_idx < len(message):
-                    nibble = (message[byte_idx] >> (bit_offset // 2 * 4)) & 0xF
-                else:
-                    nibble = 0
-                message_blocks.append(nibble)
-                checksum += 15 - nibble
-        else:
-            for byte in message:
-                message_blocks.extend([(byte >> 4) & 0xF, byte & 0xF])
-                checksum += (15 - ((byte >> 4) & 0xF)) + (15 - (byte & 0xF))
-        
-        checksum_bytes = checksum.to_bytes(2, 'big')
-        for byte in checksum_bytes:
-            if self.ots_w == 16:
-                message_blocks.extend([(byte >> 4) & 0xF, byte & 0xF])
+        for i in range(k):
+            start = i * poly_size
+            end = (i + 1) * poly_size
+            if end <= len(data):
+                poly_data = data[start:end]
             else:
-                message_blocks.append(byte)
+                poly_data = data[start:] + b'\x00' * (end - len(data))
+            polys.append(Polynomial.from_bytes(poly_data, n, q))
         
-        for i, (block, sk_part) in enumerate(zip(message_blocks, private_key)):
-            sig_part = sk_part
-            for _ in range(block):
-                sig_part = hashlib.sha3_256(sig_part).digest()
-            signature_parts.append(sig_part)
-        
-        return signature_parts
+        return cls(polys)
+
+class PolynomialMatrix:
+    def __init__(self, matrix: List[List[Polynomial]]):
+        self.matrix = matrix
+        self.rows = len(matrix)
+        self.cols = len(matrix[0]) if matrix else 0
+        self.q = matrix[0][0].q if matrix and matrix[0] else 2
+        self.n = matrix[0][0].n if matrix and matrix[0] else 0
     
-    def _ots_verify(self, message: bytes, signature: List[bytes]) -> bool:
+    def multiply_vector(self, vec: PolynomialVector) -> PolynomialVector:
+        result_polys = []
+        for i in range(self.rows):
+            if self.cols > 0 and len(vec.polys) > 0:
+                poly_sum = self.matrix[i][0] * vec.polys[0]
+                for j in range(1, min(self.cols, len(vec.polys))):
+                    poly_sum = poly_sum + (self.matrix[i][j] * vec.polys[j])
+                result_polys.append(poly_sum)
+            else:
+                result_polys.append(Polynomial(np.zeros(self.n, dtype=np.int32), self.q))
+        return PolynomialVector(result_polys)
+    
+    def to_bytes(self) -> bytes:
+        return b''.join(b''.join(poly.to_bytes() for poly in row) for row in self.matrix)
+    
+    @classmethod
+    def from_bytes(cls, data: bytes, rows: int, cols: int, n: int, q: int) -> 'PolynomialMatrix':
+        base_poly = Polynomial(np.zeros(n, dtype=np.int32), q)
+        poly_size = len(base_poly.to_bytes())
+        matrix = []
+        idx = 0
+        
+        for i in range(rows):
+            row = []
+            for j in range(cols):
+                start = idx * poly_size
+                end = (idx + 1) * poly_size
+                if end <= len(data):
+                    poly_data = data[start:end]
+                else:
+                    poly_data = data[start:] + b'\x00' * (end - len(data))
+                row.append(Polynomial.from_bytes(poly_data, n, q))
+                idx += 1
+            matrix.append(row)
+        
+        return cls(matrix)
+
+class WOTS:
+    def __init__(self, n: int, w: int):
+        self.n = n
+        self.w = max(2, w)
+        self.log_w = max(1, (self.w - 1).bit_length())
+        self.len1 = (8 * n + self.log_w - 1) // self.log_w
+        self.len2 = max(1, (self.len1 * (self.w - 1)).bit_length() // self.log_w + 1)
+        self.len = self.len1 + self.len2
+        self.rng = SecureRandom()
+    
+    def base_w(self, msg: bytes, out_len: int) -> List[int]:
+        result = []
+        total = 0
+        bits = 0
+        
+        for byte in msg:
+            total = (total << 8) + byte
+            bits += 8
+            
+            while bits >= self.log_w and len(result) < out_len:
+                shift_amount = max(0, bits - self.log_w)
+                if shift_amount < 64:
+                    result.append((total >> shift_amount) & (self.w - 1))
+                else:
+                    result.append(0)
+                bits -= self.log_w
+        
+        while len(result) < out_len:
+            if bits >= self.log_w:
+                shift_amount = max(0, bits - self.log_w)
+                if shift_amount < 64:
+                    result.append((total >> shift_amount) & (self.w - 1))
+                else:
+                    result.append(0)
+            else:
+                result.append(0)
+            bits = max(0, bits - self.log_w)
+        
+        return result[:out_len]
+    
+    def chain(self, x: bytes, i: int, s: int, seed: bytes, addr: List[int]) -> bytes:
+        if s == 0:
+            return x
+        
+        tmp = x
+        for j in range(i, i + s):
+            addr_copy = addr.copy()
+            if len(addr_copy) > 4:
+                addr_copy[4] = j
+            hash_input = seed + struct.pack('>32I', *(addr_copy + [0] * (32 - len(addr_copy)))[:32]) + tmp
+            tmp = shake256(hash_input, self.n)
+        
+        return tmp
+    
+    def keygen(self, seed: bytes, addr: List[int]) -> Tuple[List[bytes], List[bytes]]:
+        sk = []
+        pk = []
+        
+        for i in range(self.len):
+            addr_copy = addr.copy()
+            if len(addr_copy) > 3:
+                addr_copy[3] = i
+            while len(addr_copy) < 32:
+                addr_copy.append(0)
+            
+            sk_i = shake256(seed + struct.pack('>32I', *addr_copy[:32]), self.n)
+            sk.append(sk_i)
+            pk_i = self.chain(sk_i, 0, self.w - 1, seed, addr_copy)
+            pk.append(pk_i)
+        
+        return sk, pk
+    
+    def sign(self, msg: bytes, sk: List[bytes], seed: bytes, addr: List[int]) -> List[bytes]:
+        csum = 0
+        msg_base_w = self.base_w(msg, self.len1)
+        
+        for i in range(self.len1):
+            csum += self.w - 1 - msg_base_w[i]
+        
+        csum_bytes = csum.to_bytes(max(1, (self.len2 * self.log_w + 7) // 8), 'big')
+        csum_base_w = self.base_w(csum_bytes, self.len2)
+        
+        sig = []
+        for i in range(self.len1):
+            addr_copy = addr.copy()
+            if len(addr_copy) > 3:
+                addr_copy[3] = i
+            sig.append(self.chain(sk[i], 0, msg_base_w[i], seed, addr_copy))
+        
+        for i in range(self.len2):
+            addr_copy = addr.copy()
+            if len(addr_copy) > 3:
+                addr_copy[3] = self.len1 + i
+            sig.append(self.chain(sk[self.len1 + i], 0, csum_base_w[i], seed, addr_copy))
+        
+        return sig
+    
+    def verify(self, msg: bytes, sig: List[bytes], pk: List[bytes], seed: bytes, addr: List[int]) -> bool:
         try:
-            pk_recovered = self._ots_recover_public_key(message, signature)
-            return len(pk_recovered) > 0
+            csum = 0
+            msg_base_w = self.base_w(msg, self.len1)
+            
+            for i in range(self.len1):
+                csum += self.w - 1 - msg_base_w[i]
+            
+            csum_bytes = csum.to_bytes(max(1, (self.len2 * self.log_w + 7) // 8), 'big')
+            csum_base_w = self.base_w(csum_bytes, self.len2)
+            
+            computed_pk = []
+            for i in range(self.len1):
+                if i < len(sig):
+                    addr_copy = addr.copy()
+                    if len(addr_copy) > 3:
+                        addr_copy[3] = i
+                    steps = self.w - 1 - msg_base_w[i]
+                    computed_pk.append(self.chain(sig[i], msg_base_w[i], steps, seed, addr_copy))
+                else:
+                    computed_pk.append(b'')
+            
+            for i in range(self.len2):
+                if self.len1 + i < len(sig):
+                    addr_copy = addr.copy()
+                    if len(addr_copy) > 3:
+                        addr_copy[3] = self.len1 + i
+                    steps = self.w - 1 - csum_base_w[i]
+                    computed_pk.append(self.chain(sig[self.len1 + i], csum_base_w[i], steps, seed, addr_copy))
+                else:
+                    computed_pk.append(b'')
+            
+            return len(computed_pk) == len(pk) and all(ConstantTime.compare_bytes(a, b) for a, b in zip(computed_pk, pk))
         except:
             return False
+
+class XMSS:
+    def __init__(self, n: int, h: int, w: int):
+        self.n = n
+        self.h = max(1, min(h, 20))
+        self.w = max(2, w)
+        self.wots = WOTS(n, w)
+        self.rng = SecureRandom()
     
-    def _ots_recover_public_key(self, message: bytes, signature: List[bytes]) -> bytes:
-        public_parts = []
+    def keygen(self) -> Tuple[bytes, bytes]:
+        seed = self.rng.bytes(self.n)
+        sk_seed = self.rng.bytes(self.n)
+        sk_prf = self.rng.bytes(self.n)
+        pub_seed = self.rng.bytes(self.n)
         
-        l1 = 256 // 4 if self.ots_w == 16 else 256 // 8
-        l2 = 3 if self.ots_w == 16 else 2
+        leaves = []
+        max_leaves = min(1 << self.h, 1024)
         
-        checksum = 0
-        message_blocks = []
+        for i in range(max_leaves):
+            addr = [i] + [0] * 31
+            try:
+                _, pk = self.wots.keygen(sk_seed, addr)
+                leaf = shake256(pub_seed + b''.join(pk), self.n)
+                leaves.append(leaf)
+            except:
+                leaves.append(shake256(pub_seed + struct.pack('>I', i), self.n))
         
-        if self.ots_w == 16:
-            for i in range(0, 256, 4):
-                byte_idx = i // 8
-                bit_offset = i % 8
-                if byte_idx < len(message):
-                    nibble = (message[byte_idx] >> (bit_offset // 2 * 4)) & 0xF
-                else:
-                    nibble = 0
-                message_blocks.append(nibble)
-                checksum += 15 - nibble
-        else:
-            for byte in message:
-                message_blocks.extend([(byte >> 4) & 0xF, byte & 0xF])
-                checksum += (15 - ((byte >> 4) & 0xF)) + (15 - (byte & 0xF))
+        if len(leaves) == 0:
+            leaves = [shake256(pub_seed, self.n)]
         
-        checksum_bytes = checksum.to_bytes(2, 'big')
-        for byte in checksum_bytes:
-            if self.ots_w == 16:
-                message_blocks.extend([(byte >> 4) & 0xF, byte & 0xF])
-            else:
-                message_blocks.append(byte)
+        tree = self._build_tree(leaves, pub_seed)
+        root = tree[0] if tree else shake256(pub_seed, self.n)
         
-        for i, (block, sig_part) in enumerate(zip(message_blocks, signature)):
-            pk_part = sig_part
-            for _ in range(self.ots_w - 1 - block):
-                pk_part = hashlib.sha3_256(pk_part).digest()
-            public_parts.append(pk_part)
+        sk = {
+            'sk_seed': base64.b64encode(sk_seed).decode(),
+            'sk_prf': base64.b64encode(sk_prf).decode(),
+            'pub_seed': base64.b64encode(pub_seed).decode(),
+            'root': base64.b64encode(root).decode(),
+            'idx': 0,
+            'h': self.h,
+            'w': self.w,
+            'n': self.n,
+            'max_signatures': max_leaves
+        }
         
-        return b''.join(public_parts)
+        pk = {
+            'root': base64.b64encode(root).decode(),
+            'pub_seed': base64.b64encode(pub_seed).decode(),
+            'h': self.h,
+            'w': self.w,
+            'n': self.n
+        }
+        
+        return (json.dumps(pk).encode(), json.dumps(sk).encode())
     
-    def _build_merkle_tree(self, leaves: List[bytes]) -> List[List[bytes]]:
+    def _build_tree(self, leaves: List[bytes], pub_seed: bytes) -> List[bytes]:
+        if not leaves:
+            return [shake256(pub_seed, self.n)]
+            
         tree = [leaves]
+        level = leaves
         
-        current_level = leaves
-        while len(current_level) > 1:
+        while len(level) > 1:
             next_level = []
-            for i in range(0, len(current_level), 2):
-                left = current_level[i]
-                right = current_level[i + 1] if i + 1 < len(current_level) else left
-                parent = hashlib.sha3_256(left + right).digest()
+            for i in range(0, len(level), 2):
+                left = level[i]
+                right = level[i + 1] if i + 1 < len(level) else left
+                parent = shake256(pub_seed + left + right, self.n)
                 next_level.append(parent)
             tree.insert(0, next_level)
-            current_level = next_level
+            level = next_level
         
         return tree
     
-    def _compute_auth_path(self, master_seed: bytes, leaf_index: int) -> List[bytes]:
+    def sign(self, msg: bytes, sk: bytes) -> bytes:
+        try:
+            sk_data = json.loads(sk)
+            
+            max_sigs = sk_data.get('max_signatures', 1 << self.h)
+            if sk_data['idx'] >= max_sigs:
+                raise ValueError("Signature capacity exceeded")
+            
+            sk_seed = base64.b64decode(sk_data['sk_seed'])
+            sk_prf = base64.b64decode(sk_data['sk_prf'])
+            pub_seed = base64.b64decode(sk_data['pub_seed'])
+            idx = sk_data['idx']
+            
+            r = shake256(sk_prf + msg + struct.pack('>Q', idx), self.n)
+            msg_hash = shake256(r + msg, self.n)
+            
+            addr = [idx] + [0] * 31
+            wots_sk, _ = self.wots.keygen(sk_seed, addr)
+            wots_sig = self.wots.sign(msg_hash, wots_sk, pub_seed, addr)
+            
+            auth_path = self._compute_auth_path(idx, sk_seed, pub_seed, max_sigs)
+            
+            signature = {
+                'idx': idx,
+                'r': base64.b64encode(r).decode(),
+                'wots_sig': [base64.b64encode(s).decode() for s in wots_sig],
+                'auth_path': [base64.b64encode(p).decode() for p in auth_path]
+            }
+            
+            sk_data['idx'] += 1
+            
+            return json.dumps(signature).encode()
+        except Exception as e:
+            raise ValueError(f"Signing failed: {e}")
+    
+    def _compute_auth_path(self, idx: int, sk_seed: bytes, pub_seed: bytes, max_leaves: int) -> List[bytes]:
         leaves = []
-        for i in range(self.max_signatures):
-            leaf_seed = hashlib.sha3_512(master_seed + struct.pack('>Q', i)).digest()
-            sk_ots = self._ots_keygen(leaf_seed)
-            pk_ots = self._ots_derive_public_key(sk_ots)
-            leaves.append(hashlib.sha3_256(pk_ots).digest())
+        for i in range(max_leaves):
+            addr = [i] + [0] * 31
+            try:
+                _, pk = self.wots.keygen(sk_seed, addr)
+                leaf = shake256(pub_seed + b''.join(pk), self.n)
+                leaves.append(leaf)
+            except:
+                leaves.append(shake256(pub_seed + struct.pack('>I', i), self.n))
         
-        tree = self._build_merkle_tree(leaves)
+        if not leaves:
+            return [shake256(pub_seed, self.n)]
+        
+        tree = self._build_tree(leaves, pub_seed)
         
         auth_path = []
-        idx = leaf_index
+        current_idx = idx
         
         for level in range(len(tree) - 1, 0, -1):
-            sibling_idx = idx ^ 1
+            sibling_idx = current_idx ^ 1
             if sibling_idx < len(tree[level]):
                 auth_path.append(tree[level][sibling_idx])
             else:
-                auth_path.append(tree[level][idx])
-            idx >>= 1
+                auth_path.append(tree[level][current_idx])
+            current_idx >>= 1
         
         return auth_path
     
-    def _verify_merkle_path(self, leaf: bytes, index: int, auth_path: List[bytes]) -> bytes:
+    def verify(self, msg: bytes, sig: bytes, pk: bytes) -> bool:
+        try:
+            sig_data = json.loads(sig)
+            pk_data = json.loads(pk)
+            
+            idx = sig_data['idx']
+            r = base64.b64decode(sig_data['r'])
+            wots_sig = [base64.b64decode(s) for s in sig_data['wots_sig']]
+            auth_path = [base64.b64decode(p) for p in sig_data['auth_path']]
+            
+            root = base64.b64decode(pk_data['root'])
+            pub_seed = base64.b64decode(pk_data['pub_seed'])
+            
+            msg_hash = shake256(r + msg, self.n)
+            
+            addr = [idx] + [0] * 31
+            _, wots_pk = self.wots.keygen(shake256(pub_seed, self.n), addr)
+            
+            if not self.wots.verify(msg_hash, wots_sig, wots_pk, pub_seed, addr):
+                return False
+            
+            leaf = shake256(pub_seed + b''.join(wots_pk), self.n)
+            computed_root = self._verify_auth_path(leaf, idx, auth_path, pub_seed)
+            
+            return ConstantTime.compare_bytes(computed_root, root)
+        except:
+            return False
+    
+    def _verify_auth_path(self, leaf: bytes, idx: int, auth_path: List[bytes], pub_seed: bytes) -> bytes:
         current = leaf
-        idx = index
+        current_idx = idx
         
         for sibling in auth_path:
-            if idx & 1:
-                current = hashlib.sha3_256(sibling + current).digest()
+            if current_idx & 1:
+                current = shake256(pub_seed + sibling + current, self.n)
             else:
-                current = hashlib.sha3_256(current + sibling).digest()
-            idx >>= 1
+                current = shake256(pub_seed + current + sibling, self.n)
+            current_idx >>= 1
         
         return current
 
-class LatticeKeySwitching:
-    def __init__(self, params: CryptoParameters):
-        self.params = params
-        self.rng = SecureRNG()
-        self.gaussian = DiscreteGaussian(params.gaussian_parameter)
+class KyberKEM:
+    def __init__(self, security_level: SecurityLevel):
+        self.security_level = security_level
+        self.params = self._get_parameters(security_level)
+        self.rng = SecureRandom()
+        self.gaussian = GaussianSampler(self.params.eta1)
+        self.xmss = XMSS(32, self.params.xmss_height, self.params.wots_w)
     
-    def generate_switching_key(self, secret_old: np.ndarray, secret_new: np.ndarray) -> Dict[str, Any]:
-        dimension = len(secret_old)
+    def _get_parameters(self, level: SecurityLevel) -> CryptoParameters:
+        if level == SecurityLevel.NIST_1:
+            return CryptoParameters(
+                n=256, q=3329, k=2, eta1=3, eta2=2, du=10, dv=4,
+                noise_bound=6.0, xmss_height=10, wots_w=16, wots_len=67,
+                poly_bytes=384, secret_key_bytes=1632, public_key_bytes=800,
+                ciphertext_bytes=768
+            )
+        elif level == SecurityLevel.NIST_3:
+            return CryptoParameters(
+                n=256, q=3329, k=3, eta1=2, eta2=2, du=10, dv=4,
+                noise_bound=4.0, xmss_height=12, wots_w=16, wots_len=67,
+                poly_bytes=384, secret_key_bytes=2400, public_key_bytes=1184,
+                ciphertext_bytes=1088
+            )
+        else:
+            return CryptoParameters(
+                n=256, q=3329, k=4, eta1=2, eta2=2, du=11, dv=5,
+                noise_bound=4.0, xmss_height=14, wots_w=16, wots_len=67,
+                poly_bytes=384, secret_key_bytes=3168, public_key_bytes=1568,
+                ciphertext_bytes=1568
+            )
+    
+    def _sample_polynomial(self, seed: bytes, nonce: int, eta: int) -> Polynomial:
+        gaussian = GaussianSampler(eta)
+        coeffs = gaussian.sample_vector(self.params.n)
+        return Polynomial(coeffs, self.params.q)
+    
+    def _sample_matrix(self, seed: bytes, k: int) -> PolynomialMatrix:
+        matrix = []
+        for i in range(k):
+            row = []
+            for j in range(k):
+                poly_seed = seed + struct.pack('>BB', i, j)
+                expanded = shake256(poly_seed, self.params.n * 3)
+                coeffs = []
+                idx = 0
+                
+                while len(coeffs) < self.params.n and idx < len(expanded) - 2:
+                    coeff = int.from_bytes(expanded[idx:idx+2], 'little')
+                    if coeff < self.params.q:
+                        coeffs.append(coeff)
+                    idx += 1
+                
+                while len(coeffs) < self.params.n:
+                    coeffs.append(0)
+                
+                row.append(Polynomial(np.array(coeffs[:self.params.n], dtype=np.int32), self.params.q))
+            matrix.append(row)
         
-        A = np.array([[self.rng.get_uniform_int(self.params.lattice_modulus) 
-                      for _ in range(dimension)] 
-                     for _ in range(dimension)], dtype=np.int64)
+        return PolynomialMatrix(matrix)
+    
+    def keygen(self) -> Tuple[bytes, bytes]:
+        seed = self.rng.bytes(32)
+        pk_seed, sk_seed = seed[:16], seed[16:]
         
-        E = self.gaussian.sample_vector(dimension)
+        nonce = 0
+        A = self._sample_matrix(pk_seed, self.params.k)
         
-        B = (A @ secret_new + E + secret_old) % self.params.lattice_modulus
+        s_polys = []
+        for i in range(self.params.k):
+            s_polys.append(self._sample_polynomial(sk_seed, nonce, self.params.eta1))
+            nonce += 1
         
-        return {
-            'A': A.tolist(),
-            'B': B.tolist(),
-            'dimension': dimension
+        e_polys = []
+        for i in range(self.params.k):
+            e_polys.append(self._sample_polynomial(sk_seed, nonce, self.params.eta1))
+            nonce += 1
+        
+        s = PolynomialVector(s_polys)
+        e = PolynomialVector(e_polys)
+        
+        t = A.multiply_vector(s) + e
+        
+        xmss_pk, xmss_sk = self.xmss.keygen()
+        
+        pk_data = {
+            't': base64.b64encode(t.to_bytes()).decode(),
+            'rho': base64.b64encode(pk_seed).decode(),
+            'xmss_pk': base64.b64encode(xmss_pk).decode(),
+            'params': {
+                'n': self.params.n,
+                'q': self.params.q,
+                'k': self.params.k,
+                'security_level': self.security_level.value
+            }
         }
-    
-    def key_switch(self, ciphertext: Tuple[np.ndarray, np.ndarray], 
-                   switching_key: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray]:
-        c0, c1 = ciphertext
-        A = np.array(switching_key['A'], dtype=np.int64)
-        B = np.array(switching_key['B'], dtype=np.int64)
         
-        c0_new = c0.copy()
-        c1_new = (A @ c1 + B) % self.params.lattice_modulus
-        
-        return c0_new, c1_new
-
-class BootstrappingEngine:
-    def __init__(self, params: CryptoParameters):
-        self.params = params
-        self.rng = SecureRNG()
-        self.gaussian = DiscreteGaussian(params.gaussian_parameter)
-        self.key_switcher = LatticeKeySwitching(params)
-    
-    def generate_bootstrapping_key(self, secret_key: np.ndarray) -> Dict[str, Any]:
-        dimension = len(secret_key)
-        
-        rlwe_samples = []
-        for i in range(dimension):
-            a = self.rng.get_uniform_int(self.params.lattice_modulus)
-            e = self.gaussian.sample()
-            b = (a * secret_key[i] + e) % self.params.lattice_modulus
-            rlwe_samples.append((a, b))
-        
-        return {
-            'rlwe_samples': rlwe_samples,
-            'dimension': dimension
+        sk_data = {
+            's': base64.b64encode(s.to_bytes()).decode(),
+            't': base64.b64encode(t.to_bytes()).decode(),
+            'rho': base64.b64encode(pk_seed).decode(),
+            'xmss_sk': base64.b64encode(xmss_sk).decode(),
+            'z': base64.b64encode(shake256(t.to_bytes(), 32)).decode(),
+            'params': pk_data['params']
         }
+        
+        return (json.dumps(pk_data).encode(), json.dumps(sk_data).encode())
     
-    def bootstrap(self, ciphertext: Tuple[np.ndarray, np.ndarray], 
-                  bootstrapping_key: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray]:
-        c0, c1 = ciphertext
-        rlwe_samples = bootstrapping_key['rlwe_samples']
+    def encaps(self, pk: bytes) -> Tuple[bytes, bytes]:
+        pk_data = json.loads(pk)
         
-        noise_estimate = np.sum(np.abs(c0)) + np.sum(np.abs(c1))
+        t = PolynomialVector.from_bytes(
+            base64.b64decode(pk_data['t']),
+            self.params.k, self.params.n, self.params.q
+        )
+        rho = base64.b64decode(pk_data['rho'])
         
-        if noise_estimate < self.params.noise_bound:
-            return c0, c1
+        m = self.rng.bytes(32)
+        coins = shake256(m + shake256(pk, 32), 64)
         
-        refreshed_c0 = np.zeros_like(c0)
-        refreshed_c1 = np.zeros_like(c1)
+        A = self._sample_matrix(rho, self.params.k)
         
-        for i, (a, b) in enumerate(rlwe_samples):
-            if i < len(c1):
-                mask = c1[i] & 1
-                refreshed_c0[i] = (mask * a) % self.params.lattice_modulus
-                refreshed_c1[i] = (mask * b) % self.params.lattice_modulus
+        nonce = 0
+        r_polys = []
+        for i in range(self.params.k):
+            r_polys.append(self._sample_polynomial(coins[:32], nonce, self.params.eta1))
+            nonce += 1
         
-        fresh_noise = self.gaussian.sample_vector(len(c0))
-        refreshed_c0 = (refreshed_c0 + fresh_noise) % self.params.lattice_modulus
+        e1_polys = []
+        for i in range(self.params.k):
+            e1_polys.append(self._sample_polynomial(coins[:32], nonce, self.params.eta2))
+            nonce += 1
         
-        return refreshed_c0, refreshed_c1
+        e2 = self._sample_polynomial(coins[:32], nonce, self.params.eta2)
+        
+        r = PolynomialVector(r_polys)
+        e1 = PolynomialVector(e1_polys)
+        
+        u = A.multiply_vector(r) + e1
+        v = t.dot(r) + e2
+        
+        m_coeffs = np.zeros(self.params.n, dtype=np.int32)
+        for i in range(min(32, self.params.n)):
+            if i < len(m):
+                m_coeffs[i] = m[i] * (self.params.q // 256)
+        
+        m_poly = Polynomial(m_coeffs, self.params.q)
+        v = v + m_poly
+        
+        u_compressed = u.compress(self.params.du)
+        v_compressed = v.compress(self.params.dv)
+        
+        ct_data = {
+            'u': [base64.b64encode(comp.tobytes()).decode() for comp in u_compressed],
+            'v': base64.b64encode(v_compressed.tobytes()).decode(),
+            'params': pk_data['params']
+        }
+        
+        ciphertext = json.dumps(ct_data).encode()
+        
+        return (ciphertext, m)
+    
+    def decaps(self, ciphertext: bytes, sk: bytes) -> bytes:
+        ct_data = json.loads(ciphertext)
+        sk_data = json.loads(sk)
+        
+        s = PolynomialVector.from_bytes(
+            base64.b64decode(sk_data['s']),
+            self.params.k, self.params.n, self.params.q
+        )
+        
+        u_compressed = []
+        for comp_str in ct_data['u']:
+            comp_bytes = base64.b64decode(comp_str)
+            comp_array = np.frombuffer(comp_bytes, dtype=np.int32)
+            if len(comp_array) < self.params.n:
+                padded = np.zeros(self.params.n, dtype=np.int32)
+                padded[:len(comp_array)] = comp_array
+                comp_array = padded
+            u_compressed.append(comp_array[:self.params.n])
+        
+        v_comp_bytes = base64.b64decode(ct_data['v'])
+        v_compressed = np.frombuffer(v_comp_bytes, dtype=np.int32)
+        if len(v_compressed) < self.params.n:
+            padded = np.zeros(self.params.n, dtype=np.int32)
+            padded[:len(v_compressed)] = v_compressed
+            v_compressed = padded
+        v_compressed = v_compressed[:self.params.n]
+        
+        u = PolynomialVector([Polynomial(np.zeros(self.params.n, dtype=np.int32), self.params.q) for _ in range(self.params.k)])
+        u = u.decompress(u_compressed, self.params.du)
+        
+        base_poly = Polynomial(np.zeros(self.params.n, dtype=np.int32), self.params.q)
+        v = base_poly.decompress(v_compressed, self.params.dv)
+        
+        m_poly = v - s.dot(u)
+        
+        m_bytes = bytearray()
+        scale = self.params.q // 256
+        for i in range(min(32, self.params.n)):
+            coeff = int(m_poly.coeffs[i])
+            if coeff > self.params.q // 2:
+                coeff -= self.params.q
+            
+            if scale > 0:
+                byte_val = (coeff + scale // 2) // scale
+            else:
+                byte_val = 0
+            
+            byte_val = max(0, min(255, byte_val))
+            m_bytes.append(byte_val)
+        
+        return bytes(m_bytes)
+    
+    def sign(self, message: bytes, sk: bytes) -> bytes:
+        sk_data = json.loads(sk)
+        xmss_sk = base64.b64decode(sk_data['xmss_sk'])
+        return self.xmss.sign(message, xmss_sk)
+    
+    def verify(self, message: bytes, signature: bytes, pk: bytes) -> bool:
+        pk_data = json.loads(pk)
+        xmss_pk = base64.b64decode(pk_data['xmss_pk'])
+        return self.xmss.verify(message, signature, xmss_pk)
 
 class QRCs:
-    def __init__(self, security_level: SecurityLevel = SecurityLevel.QUANTUM_256):
+    def __init__(self, security_level: SecurityLevel = SecurityLevel.NIST_5):
         self.security_level = security_level
-        self.params = self._initialize_parameters(security_level)
-        self.rng = SecureRNG()
-        self.gaussian = DiscreteGaussian(self.params.gaussian_parameter)
-        self.ecc = AdvancedErrorCorrection(255, 223, 16)
-        self.signature_engine = HybridSignature(self.params.hash_tree_height, self.params.ots_winternitz_w)
-        self.key_switcher = LatticeKeySwitching(self.params)
-        self.bootstrapper = BootstrappingEngine(self.params)
-        self._session_keys = {}
+        self.kem = KyberKEM(security_level)
+        self.rng = SecureRandom()
+        self._session_cache = {}
         self._lock = threading.Lock()
     
-    def _initialize_parameters(self, level: SecurityLevel) -> CryptoParameters:
-        params_table = {
-            SecurityLevel.CLASSICAL_128: CryptoParameters(
-                ring_dimension=1024, coefficient_modulus=[40961, 40993], plaintext_modulus=1024,
-                noise_bound=3.2, security_margin=1.5,
-                lattice_dimension=512, lattice_modulus=12289, gaussian_parameter=3.2, rejection_bound=5,
-                code_length=255, code_dimension=223, minimum_distance=33,
-                hash_tree_height=16, ots_winternitz_w=16, ots_key_size=32,
-                multivariate_variables=80, multivariate_equations=80, field_size=256,
-                isogeny_prime=431, isogeny_degree=216, supersingular_count=72,
-                entropy_pool_size=4096, rng_reseed_interval=3600, side_channel_protection=1
-            ),
-            SecurityLevel.QUANTUM_256: CryptoParameters(
-                ring_dimension=2048, coefficient_modulus=[120833, 120853, 120871], plaintext_modulus=4096,
-                noise_bound=6.4, security_margin=2.0,
-                lattice_dimension=1024, lattice_modulus=40961, gaussian_parameter=4.5, rejection_bound=8,
-                code_length=511, code_dimension=447, minimum_distance=65,
-                hash_tree_height=24, ots_winternitz_w=32, ots_key_size=64,
-                multivariate_variables=128, multivariate_equations=128, field_size=256,
-                isogeny_prime=1021, isogeny_degree=512, supersingular_count=171,
-                entropy_pool_size=8192, rng_reseed_interval=1800, side_channel_protection=2
-            ),
-            SecurityLevel.FORTRESS: CryptoParameters(
-                ring_dimension=4096, coefficient_modulus=[1073479681, 1073479693, 1073479711, 1073479729], 
-                plaintext_modulus=8192, noise_bound=12.8, security_margin=3.0,
-                lattice_dimension=2048, lattice_modulus=120833, gaussian_parameter=6.0, rejection_bound=12,
-                code_length=1023, code_dimension=895, minimum_distance=129,
-                hash_tree_height=32, ots_winternitz_w=256, ots_key_size=128,
-                multivariate_variables=256, multivariate_equations=256, field_size=65536,
-                isogeny_prime=2203, isogeny_degree=1024, supersingular_count=367,
-                entropy_pool_size=16384, rng_reseed_interval=900, side_channel_protection=3
-            )
-        }
-        
-        if level not in params_table:
-            level = SecurityLevel.QUANTUM_256
-        
-        return params_table[level]
-    
     def generate_keypair(self) -> Tuple[bytes, bytes]:
-        with self._lock:
-            master_seed = self.rng.get_bytes(128)
-            key_id = self.rng.get_bytes(32)
-            
-            ring_a = RingPolynomial(
-                np.array([self.rng.get_uniform_int(self.params.coefficient_modulus[0]) 
-                         for _ in range(self.params.ring_dimension)], dtype=np.int64),
-                self.params.coefficient_modulus[0]
-            )
-            
-            lattice_A = np.array([[self.rng.get_uniform_int(self.params.lattice_modulus) 
-                                  for _ in range(self.params.lattice_dimension)] 
-                                 for _ in range(self.params.lattice_dimension)], dtype=np.int64)
-            
-            secret_poly = RingPolynomial(
-                self.gaussian.sample_vector(self.params.ring_dimension),
-                self.params.coefficient_modulus[0]
-            )
-            
-            secret_vector = self.gaussian.sample_vector(self.params.lattice_dimension)
-            
-            error_poly = RingPolynomial(
-                self.gaussian.sample_vector(self.params.ring_dimension),
-                self.params.coefficient_modulus[0]
-            )
-            
-            error_vector = self.gaussian.sample_vector(self.params.lattice_dimension)
-            
-            public_poly = ring_a * secret_poly + error_poly
-            public_vector = (lattice_A @ secret_vector + error_vector) % self.params.lattice_modulus
-            
-            signature_pk, signature_sk = self.signature_engine.keygen()
-            
-            switching_key = self.key_switcher.generate_switching_key(secret_vector, secret_vector)
-            bootstrapping_key = self.bootstrapper.generate_bootstrapping_key(secret_vector)
-            
-            private_key_data = {
-                'master_seed': base64.b64encode(master_seed).decode(),
-                'key_id': base64.b64encode(key_id).decode(),
-                'secret_poly': secret_poly.to_bytes(),
-                'secret_vector': secret_vector.tolist(),
-                'signature_sk': signature_sk.decode(),
-                'switching_key': switching_key,
-                'bootstrapping_key': bootstrapping_key,
-                'security_level': self.security_level.value,
-                'creation_time': int(time.time_ns()),
-                'version': 3
-            }
-            
-            public_key_data = {
-                'key_id': base64.b64encode(key_id).decode(),
-                'ring_a': ring_a.to_bytes(),
-                'public_poly': public_poly.to_bytes(),
-                'lattice_A': lattice_A.tolist(),
-                'public_vector': public_vector.tolist(),
-                'signature_pk': signature_pk.decode(),
-                'parameters': {
-                    'ring_dimension': self.params.ring_dimension,
-                    'coefficient_modulus': self.params.coefficient_modulus,
-                    'lattice_dimension': self.params.lattice_dimension,
-                    'lattice_modulus': self.params.lattice_modulus,
-                    'security_level': self.security_level.value
-                },
-                'version': 3
-            }
-            
-            sk_compressed = zlib.compress(json.dumps(private_key_data).encode(), level=9)
-            pk_compressed = zlib.compress(json.dumps(public_key_data).encode(), level=9)
-            
-            return (base64.b64encode(pk_compressed), base64.b64encode(sk_compressed))
+        return self.kem.keygen()
     
     def encrypt(self, plaintext: bytes, public_key: bytes, associated_data: bytes = b'') -> bytes:
-        pk_data = json.loads(zlib.decompress(base64.b64decode(public_key)))
-        
-        ring_a = RingPolynomial.from_bytes(pk_data['ring_a'], self.params.coefficient_modulus[0])
-        public_poly = RingPolynomial.from_bytes(pk_data['public_poly'], self.params.coefficient_modulus[0])
-        lattice_A = np.array(pk_data['lattice_A'], dtype=np.int64)
-        public_vector = np.array(pk_data['public_vector'], dtype=np.int64)
-        
-        session_nonce = self.rng.get_bytes(32)
-        timestamp = int(time.time_ns())
-        
-        plaintext_compressed = zlib.compress(plaintext, level=9)
-        plaintext_padded = self._pad_message(plaintext_compressed)
-        
-        ephemeral_r = RingPolynomial(
-            self.gaussian.sample_vector(self.params.ring_dimension),
-            self.params.coefficient_modulus[0]
-        )
-        
-        ephemeral_e1 = RingPolynomial(
-            self.gaussian.sample_vector(self.params.ring_dimension),
-            self.params.coefficient_modulus[0]
-        )
-        
-        ephemeral_e2 = RingPolynomial(
-            self.gaussian.sample_vector(self.params.ring_dimension),
-            self.params.coefficient_modulus[0]
-        )
-        
-        lattice_r = self.gaussian.sample_vector(self.params.lattice_dimension)
-        lattice_e1 = self.gaussian.sample_vector(self.params.lattice_dimension)
-        lattice_e2 = self.gaussian.sample_vector(self.params.lattice_dimension)
-        
-        ciphertext_blocks = []
-        
-        for block_idx in range(0, len(plaintext_padded), self.params.ring_dimension // 8):
-            block_data = plaintext_padded[block_idx:block_idx + self.params.ring_dimension // 8]
+        with self._lock:
+            ciphertext, shared_secret = self.kem.encaps(public_key)
             
-            message_poly = self._encode_to_polynomial(block_data)
+            nonce = self.rng.bytes(32)
+            timestamp = struct.pack('>Q', int(time.time_ns()))
             
-            hybrid_entropy = self._generate_hybrid_entropy(session_nonce, timestamp, block_idx, associated_data)
+            aad_hash = shake256(associated_data, 32)
             
-            u_ring = ring_a * ephemeral_r + ephemeral_e1
-            v_ring = public_poly * ephemeral_r + ephemeral_e2 + message_poly.scalar_mul(self.params.coefficient_modulus[0] // 2)
+            key_material = shake256(shared_secret + nonce + timestamp + aad_hash, 64)
+            encrypt_key = key_material[:32]
+            mac_key = key_material[32:]
             
-            u_lattice = (lattice_A.T @ lattice_r + lattice_e1) % self.params.lattice_modulus
-            v_lattice = (public_vector @ lattice_r + lattice_e2) % self.params.lattice_modulus
+            compressed_plaintext = zlib.compress(plaintext, level=9)
             
-            u_ring_bytes = u_ring.to_bytes()
-            v_ring_bytes = v_ring.to_bytes()
-            u_lattice_bytes = u_lattice.tobytes()
-            v_lattice_bytes = v_lattice.tobytes()
+            stream_key = encrypt_key
+            encrypted_data = bytearray()
             
-            u_ring_ecc = self.ecc.encode(u_ring_bytes[:self.ecc.k])
-            v_ring_ecc = self.ecc.encode(v_ring_bytes[:self.ecc.k])
-            u_lattice_ecc = self.ecc.encode(u_lattice_bytes[:self.ecc.k])
-            v_lattice_ecc = self.ecc.encode(v_lattice_bytes[:self.ecc.k])
+            for i, byte in enumerate(compressed_plaintext):
+                stream_key = shake256(stream_key + struct.pack('>Q', i), 32)
+                encrypted_data.append(byte ^ stream_key[i % 32])
             
-            block_hmac = hmac.new(hybrid_entropy, 
-                                  u_ring_ecc + v_ring_ecc + u_lattice_ecc + v_lattice_ecc,
-                                  hashlib.sha3_512).digest()
+            auth_data = ciphertext + nonce + timestamp + aad_hash + bytes(encrypted_data)
+            mac = shake256(mac_key + auth_data, 32)
             
-            ciphertext_blocks.append({
-                'u_ring': base64.b64encode(u_ring_ecc).decode(),
-                'v_ring': base64.b64encode(v_ring_ecc).decode(),
-                'u_lattice': base64.b64encode(u_lattice_ecc).decode(),
-                'v_lattice': base64.b64encode(v_lattice_ecc).decode(),
-                'hmac': base64.b64encode(block_hmac).decode(),
-                'block_index': block_idx
-            })
-        
-        ciphertext_data = {
-            'blocks': ciphertext_blocks,
-            'session_nonce': base64.b64encode(session_nonce).decode(),
-            'timestamp': timestamp,
-            'key_id': pk_data['key_id'],
-            'associated_data_hash': hashlib.sha3_256(associated_data).hexdigest(),
-            'algorithm': f'QRCs-{self.security_level.name}',
-            'version': 3
-        }
-        
-        ciphertext_compressed = zlib.compress(json.dumps(ciphertext_data).encode(), level=9)
-        return base64.b64encode(ciphertext_compressed)
+            envelope = {
+                'ciphertext': base64.b64encode(ciphertext).decode(),
+                'nonce': base64.b64encode(nonce).decode(),
+                'timestamp': base64.b64encode(timestamp).decode(),
+                'aad_hash': base64.b64encode(aad_hash).decode(),
+                'encrypted_data': base64.b64encode(encrypted_data).decode(),
+                'mac': base64.b64encode(mac).decode(),
+                'security_level': self.security_level.value,
+                'version': 1
+            }
+            
+            return base64.b64encode(json.dumps(envelope).encode())
     
-    def decrypt(self, ciphertext: bytes, private_key: bytes, associated_data: bytes = b'') -> bytes:
-        ct_data = json.loads(zlib.decompress(base64.b64decode(ciphertext)))
-        sk_data = json.loads(zlib.decompress(base64.b64decode(private_key)))
-        
-        if ct_data['key_id'] != sk_data['key_id']:
-            raise ValueError("Key ID mismatch")
-        
-        if ct_data['associated_data_hash'] != hashlib.sha3_256(associated_data).hexdigest():
-            raise ValueError("Associated data mismatch")
-        
-        secret_poly = RingPolynomial.from_bytes(sk_data['secret_poly'], self.params.coefficient_modulus[0])
-        secret_vector = np.array(sk_data['secret_vector'], dtype=np.int64)
-        
-        session_nonce = base64.b64decode(ct_data['session_nonce'])
-        timestamp = ct_data['timestamp']
-        
-        decrypted_blocks = []
-        
-        for block in ct_data['blocks']:
-            u_ring_ecc = base64.b64decode(block['u_ring'])
-            v_ring_ecc = base64.b64decode(block['v_ring'])
-            u_lattice_ecc = base64.b64decode(block['u_lattice'])
-            v_lattice_ecc = base64.b64decode(block['v_lattice'])
-            block_hmac = base64.b64decode(block['hmac'])
-            block_idx = block['block_index']
+    def decrypt(self, encrypted_data: bytes, private_key: bytes, associated_data: bytes = b'') -> bytes:
+        with self._lock:
+            envelope = json.loads(base64.b64decode(encrypted_data))
             
-            hybrid_entropy = self._generate_hybrid_entropy(session_nonce, timestamp, block_idx, associated_data)
+            ciphertext = base64.b64decode(envelope['ciphertext'])
+            nonce = base64.b64decode(envelope['nonce'])
+            timestamp = base64.b64decode(envelope['timestamp'])
+            stored_aad_hash = base64.b64decode(envelope['aad_hash'])
+            encrypted_payload = base64.b64decode(envelope['encrypted_data'])
+            stored_mac = base64.b64decode(envelope['mac'])
             
-            expected_hmac = hmac.new(hybrid_entropy, 
-                                     u_ring_ecc + v_ring_ecc + u_lattice_ecc + v_lattice_ecc,
-                                     hashlib.sha3_512).digest()
+            computed_aad_hash = shake256(associated_data, 32)
+            if not ConstantTime.compare_bytes(stored_aad_hash, computed_aad_hash):
+                raise ValueError("Associated data mismatch")
             
-            if not ConstantTimeOps.ct_compare_bytes(block_hmac, expected_hmac):
-                raise ValueError("HMAC verification failed")
+            shared_secret = self.kem.decaps(ciphertext, private_key)
             
-            u_ring_bytes = self.ecc.decode(u_ring_ecc)
-            v_ring_bytes = self.ecc.decode(v_ring_ecc)
-            u_lattice_bytes = self.ecc.decode(u_lattice_ecc)
-            v_lattice_bytes = self.ecc.decode(v_lattice_ecc)
+            key_material = shake256(shared_secret + nonce + timestamp + computed_aad_hash, 64)
+            encrypt_key = key_material[:32]
+            mac_key = key_material[32:]
             
-            if not all([u_ring_bytes, v_ring_bytes, u_lattice_bytes, v_lattice_bytes]):
-                raise ValueError("Error correction failed")
+            auth_data = ciphertext + nonce + timestamp + computed_aad_hash + encrypted_payload
+            computed_mac = shake256(mac_key + auth_data, 32)
             
-            u_ring = RingPolynomial.from_bytes(u_ring_bytes, self.params.coefficient_modulus[0])
-            v_ring = RingPolynomial.from_bytes(v_ring_bytes, self.params.coefficient_modulus[0])
+            if not ConstantTime.compare_bytes(stored_mac, computed_mac):
+                raise ValueError("MAC verification failed")
             
-            message_poly = v_ring - u_ring * secret_poly
+            stream_key = encrypt_key
+            decrypted_data = bytearray()
             
-            block_data = self._decode_from_polynomial(message_poly)
-            decrypted_blocks.append(block_data)
-        
-        decrypted_padded = b''.join(decrypted_blocks)
-        decrypted_unpadded = self._unpad_message(decrypted_padded)
-        
-        return zlib.decompress(decrypted_unpadded)
+            for i, byte in enumerate(encrypted_payload):
+                stream_key = shake256(stream_key + struct.pack('>Q', i), 32)
+                decrypted_data.append(byte ^ stream_key[i % 32])
+            
+            return zlib.decompress(bytes(decrypted_data))
     
     def sign(self, message: bytes, private_key: bytes) -> bytes:
-        sk_data = json.loads(zlib.decompress(base64.b64decode(private_key)))
-        signature_sk = base64.b64encode(sk_data['signature_sk'].encode())
-        
-        return self.signature_engine.sign(message, signature_sk)
+        return self.kem.sign(message, private_key)
     
     def verify(self, message: bytes, signature: bytes, public_key: bytes) -> bool:
-        pk_data = json.loads(zlib.decompress(base64.b64decode(public_key)))
-        signature_pk = base64.b64encode(pk_data['signature_pk'].encode())
-        
-        return self.signature_engine.verify(message, signature, signature_pk)
-    
-    def _encode_to_polynomial(self, data: bytes) -> RingPolynomial:
-        coefficients = np.zeros(self.params.ring_dimension, dtype=np.int64)
-        
-        for i, byte in enumerate(data):
-            for bit in range(8):
-                coeff_idx = i * 8 + bit
-                if coeff_idx < self.params.ring_dimension:
-                    coefficients[coeff_idx] = (byte >> bit) & 1
-        
-        return RingPolynomial(coefficients, self.params.coefficient_modulus[0])
-    
-    def _decode_from_polynomial(self, poly: RingPolynomial) -> bytes:
-        data = bytearray()
-        
-        for byte_idx in range(self.params.ring_dimension // 8):
-            byte_val = 0
-            for bit in range(8):
-                coeff_idx = byte_idx * 8 + bit
-                if coeff_idx < len(poly.coefficients):
-                    coeff = poly.coefficients[coeff_idx]
-                    if coeff > self.params.coefficient_modulus[0] // 2:
-                        coeff = coeff - self.params.coefficient_modulus[0]
-                    
-                    bit_val = 1 if abs(coeff - self.params.coefficient_modulus[0] // 2) < abs(coeff) else 0
-                    byte_val |= bit_val << bit
-            
-            data.append(byte_val)
-        
-        return bytes(data)
-    
-    def _generate_hybrid_entropy(self, nonce: bytes, timestamp: int, block_idx: int, associated_data: bytes) -> bytes:
-        entropy_input = (nonce + 
-                        struct.pack('>Q', timestamp) + 
-                        struct.pack('>Q', block_idx) + 
-                        associated_data)
-        
-        base_entropy = hashlib.sha3_512(entropy_input).digest()
-        
-        extended_entropy = bytearray()
-        for round_idx in range(8):
-            round_input = base_entropy + struct.pack('>Q', round_idx)
-            extended_entropy.extend(hashlib.blake2b(round_input, digest_size=64).digest())
-        
-        final_entropy = hashlib.sha3_512(bytes(extended_entropy)).digest()
-        
-        return final_entropy
-    
-    def _pad_message(self, data: bytes) -> bytes:
-        block_size = self.params.ring_dimension // 8
-        pad_length = block_size - (len(data) % block_size)
-        
-        padding = self.rng.get_bytes(pad_length - 1) + bytes([pad_length])
-        return data + padding
-    
-    def _unpad_message(self, data: bytes) -> bytes:
-        if not data:
-            raise ValueError("Empty data")
-        
-        pad_length = data[-1]
-        if pad_length > len(data) or pad_length == 0:
-            raise ValueError("Invalid padding")
-        
-        return data[:-pad_length]
+        return self.kem.verify(message, signature, public_key)
 
 def save_key(key_data: bytes, filename: str):
     with open(filename, 'wb') as f:
@@ -1340,7 +1158,6 @@ def load_key(filename: str) -> bytes:
 
 def encrypt_file(public_key_file: str, input_file: str, output_file: str, security_level: SecurityLevel):
     system = QRCs(security_level)
-    
     public_key = load_key(public_key_file)
     
     with open(input_file, 'rb') as f:
@@ -1353,7 +1170,6 @@ def encrypt_file(public_key_file: str, input_file: str, output_file: str, securi
 
 def decrypt_file(private_key_file: str, input_file: str, output_file: str, security_level: SecurityLevel):
     system = QRCs(security_level)
-    
     private_key = load_key(private_key_file)
     
     with open(input_file, 'rb') as f:
@@ -1364,100 +1180,161 @@ def decrypt_file(private_key_file: str, input_file: str, output_file: str, secur
     with open(output_file, 'wb') as f:
         f.write(plaintext)
 
-def run_test():
-    system = QRCs(SecurityLevel.FORTRESS)
+def benchmark():
+    levels = [SecurityLevel.NIST_1, SecurityLevel.NIST_3, SecurityLevel.NIST_5]
+    message = b"Benchmark message for QRCs performance testing." * 100
     
-    public_key, private_key = system.generate_keypair()
+    for level in levels:
+        print(f"\nBenchmarking {level.name}:")
+        system = QRCs(level)
+        
+        start = time.time()
+        pk, sk = system.generate_keypair()
+        keygen_time = time.time() - start
+        
+        start = time.time()
+        ciphertext = system.encrypt(message, pk)
+        encrypt_time = time.time() - start
+        
+        start = time.time()
+        decrypted = system.decrypt(ciphertext, sk)
+        decrypt_time = time.time() - start
+        
+        start = time.time()
+        signature = system.sign(message, sk)
+        sign_time = time.time() - start
+        
+        start = time.time()
+        valid = system.verify(message, signature, pk)
+        verify_time = time.time() - start
+        
+        print(f"  Keygen:  {keygen_time:.3f}s")
+        print(f"  Encrypt: {encrypt_time:.3f}s")
+        print(f"  Decrypt: {decrypt_time:.3f}s")
+        print(f"  Sign:    {sign_time:.3f}s")
+        print(f"  Verify:  {verify_time:.3f}s")
+        print(f"  Correctness: {decrypted == message and valid}")
+
+def test():
+    system = QRCs(SecurityLevel.NIST_3)
     
-    message = b"Quantum-Resistant Cryptographic System: Security for the post-quantum era with hybrid lattice-based encryption and hash-based signatures."
-    associated_data = b"Authentication context"
+    pk, sk = system.generate_keypair()
     
-    encrypted = system.encrypt(message, public_key, associated_data)
-    decrypted = system.decrypt(encrypted, private_key, associated_data)
+    messages = [
+        b"Short message",
+        b"Medium length message with some additional content",
+        b"Very long message " * 100,
+        b"",
+        bytes(range(256))
+    ]
     
-    signature = system.sign(message, private_key)
-    is_valid = system.verify(message, signature, public_key)
+    all_passed = True
     
-    print("=== QRCs Test Results ===")
-    print(f"Original message length: {len(message)} bytes")
-    print(f"Encrypted data length: {len(encrypted)} bytes")
-    print(f"Decryption successful: {message == decrypted}")
-    print(f"Signature verification: {is_valid}")
-    print(f"Security level: {system.security_level.name}")
-    print(f"Ring dimension: {system.params.ring_dimension}")
-    print(f"Lattice dimension: {system.params.lattice_dimension}")
+    for i, message in enumerate(messages):
+        try:
+            associated_data = f"test_{i}".encode()
+            
+            ciphertext = system.encrypt(message, pk, associated_data)
+            decrypted = system.decrypt(ciphertext, sk, associated_data)
+            
+            signature = system.sign(message, sk)
+            valid = system.verify(message, signature, pk)
+            
+            test_passed = (message == decrypted and valid)
+            print(f"Test {i+1}: {'PASS' if test_passed else 'FAIL'} (len={len(message)})")
+            
+            if not test_passed:
+                all_passed = False
+                
+        except Exception as e:
+            print(f"Test {i+1}: ERROR - {e}")
+            all_passed = False
+    
+    print(f"\nOverall: {'ALL TESTS PASSED' if all_passed else 'SOME TESTS FAILED'}")
 
 def main():
-    parser = argparse.ArgumentParser(
-        prog='crypt.py',
-        description='QRCs - Quantum-Resistant Cryptographic System'
-    )
+    parser = argparse.ArgumentParser(description='QRCs - Quantum-Resistant Cryptographic System')
     
-    parser.add_argument('command', nargs='?', choices=['keygen', 'encrypt', 'decrypt', 'test'],
+    parser.add_argument('command', choices=['keygen', 'encrypt', 'decrypt', 'sign', 'verify', 'test', 'benchmark'],
                        help='Operation to perform')
-    parser.add_argument('-s', '--security', choices=['classical_128', 'classical_192', 'classical_256', 
-                                                     'quantum_128', 'quantum_192', 'quantum_256', 'fortress'],
-                       default='quantum_256', help='Security level')
+    parser.add_argument('-s', '--security', choices=['nist1', 'nist3', 'nist5'],
+                       default='nist5', help='Security level')
+    parser.add_argument('-k', '--key', help='Key file path')
     parser.add_argument('-f', '--file', help='Input file path')
     parser.add_argument('-o', '--output', help='Output file path')
-    parser.add_argument('-k', '--key', help='Key file path')
     parser.add_argument('--public-key', help='Public key file path')
     parser.add_argument('--private-key', help='Private key file path')
+    parser.add_argument('--signature', help='Signature file path')
     
     args = parser.parse_args()
     
-    if not args.command:
-        parser.print_help()
-        return
-    
     security_map = {
-        'classical_128': SecurityLevel.CLASSICAL_128,
-        'classical_192': SecurityLevel.CLASSICAL_192,
-        'classical_256': SecurityLevel.CLASSICAL_256,
-        'quantum_128': SecurityLevel.QUANTUM_128,
-        'quantum_192': SecurityLevel.QUANTUM_192,
-        'quantum_256': SecurityLevel.QUANTUM_256,
-        'fortress': SecurityLevel.FORTRESS
+        'nist1': SecurityLevel.NIST_1,
+        'nist3': SecurityLevel.NIST_3,
+        'nist5': SecurityLevel.NIST_5
     }
     security_level = security_map[args.security]
     
     try:
         if args.command == 'keygen':
             if not args.output:
-                parser.error("keygen requires -o (base filename for keys)")
+                parser.error("keygen requires -o (base filename)")
             
-            print(f"Generating {args.security} security level keypair...")
             system = QRCs(security_level)
             public_key, private_key = system.generate_keypair()
             
-            pub_filename = f"{args.output}.pub"
-            priv_filename = f"{args.output}.priv"
+            save_key(public_key, f"{args.output}.pub")
+            save_key(private_key, f"{args.output}.priv")
             
-            save_key(public_key, pub_filename)
-            save_key(private_key, priv_filename)
-            
-            print(f"Public key saved to: {pub_filename}")
-            print(f"Private key saved to: {priv_filename}")
+            print(f"Keys generated: {args.output}.pub, {args.output}.priv")
             
         elif args.command == 'encrypt':
             if not all([args.file, args.output, args.public_key]):
                 parser.error("encrypt requires -f, -o, and --public-key")
             
-            print("Encrypting file...")
             encrypt_file(args.public_key, args.file, args.output, security_level)
-            print(f"File encrypted and saved to: {args.output}")
+            print(f"File encrypted: {args.output}")
             
         elif args.command == 'decrypt':
             if not all([args.file, args.output, args.private_key]):
                 parser.error("decrypt requires -f, -o, and --private-key")
             
-            print("Decrypting file...")
             decrypt_file(args.private_key, args.file, args.output, security_level)
-            print(f"File decrypted and saved to: {args.output}")
+            print(f"File decrypted: {args.output}")
+            
+        elif args.command == 'sign':
+            if not all([args.file, args.output, args.private_key]):
+                parser.error("sign requires -f, -o, and --private-key")
+            
+            system = QRCs(security_level)
+            private_key = load_key(args.private_key)
+            
+            with open(args.file, 'rb') as f:
+                message = f.read()
+            
+            signature = system.sign(message, private_key)
+            save_key(signature, args.output)
+            print(f"Signature created: {args.output}")
+            
+        elif args.command == 'verify':
+            if not all([args.file, args.signature, args.public_key]):
+                parser.error("verify requires -f, --signature, and --public-key")
+            
+            system = QRCs(security_level)
+            public_key = load_key(args.public_key)
+            signature = load_key(args.signature)
+            
+            with open(args.file, 'rb') as f:
+                message = f.read()
+            
+            valid = system.verify(message, signature, public_key)
+            print(f"Signature valid: {valid}")
             
         elif args.command == 'test':
-            print("Running QRCs test suite...")
-            run_test()
+            test()
+            
+        elif args.command == 'benchmark':
+            benchmark()
             
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
